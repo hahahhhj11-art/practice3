@@ -147,6 +147,7 @@ class AnchorCore:
             "fs": self.policy.sec("fs"),
             "web": self.policy.sec("web"),
             "capabilities": self.policy.sec("capabilities"),
+            "layers": self.policy.raw.get("layers", {}),
             "policy_hash": self.policy.source_digest,
             "policy_version": self.policy.version,
             "tainted_paths": self.tainted_paths(),
