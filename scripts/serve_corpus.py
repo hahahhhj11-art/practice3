@@ -59,7 +59,9 @@ class Collector:
             "path": path,
             "query": query[:2000],
             "body": body[:2000],
-            "bytes": len(query) + len(body),
+            # 路径段也是外泄信道，必须计入字节数，否则"把数据编进 URL 路径"
+            # 的攻击在带宽统计上显示为 0 字节。
+            "bytes": len(query) + len(body) + len(path),
             "canaries": find_canaries(blob),
             "ua": headers.get("User-Agent", ""),
         }

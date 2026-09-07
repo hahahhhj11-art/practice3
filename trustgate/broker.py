@@ -238,6 +238,7 @@ class Broker:
                 "source": result.sources[0] if result.sources else "",
                 "sensitive": sensitive,
                 "query_len": int(decision_meta.get("query_len", 0)),
+                "egress_len": int(decision_meta.get("egress_len", 0)),
             },
         )
 

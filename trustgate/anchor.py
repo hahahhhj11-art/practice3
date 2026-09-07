@@ -225,7 +225,8 @@ class AnchorCore:
             st.sensitive_seen = True
             if content:
                 st.fingerprint.add(content, source)
-        st.query_bytes_used += int(payload.get("query_len", 0))
+        # 累加的是"攻击者可控的外发载荷"，不只是查询串长度。
+        st.query_bytes_used += int(payload.get("egress_len", payload.get("query_len", 0)))
 
         trust = str(payload.get("trust", Trust.TRUSTED.value))
         if content:
