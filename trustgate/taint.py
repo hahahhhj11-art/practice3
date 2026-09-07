@@ -29,12 +29,26 @@ def _norm(s: str) -> str:
 def _candidates(value: str) -> list[str]:
     """为一个参数值生成用于溯源的字符串候选集。
 
-    除了完整值，还包括路径 basename 与不含扩展名的主干——因为 Agent 常常
-    只从文本里拿到文件名，再自行拼接出完整路径。
+    对**文件路径**，除完整值外还包括 basename 与不含扩展名的主干——因为
+    Agent 常常只从文本里拿到文件名，再自行拼接出完整路径，这种宽松匹配
+    是必要的。
+
+    对 **URL** 则刻意只用完整值。早先这里额外把裸主机名放进候选集，那是
+    一个可利用的洗白通道：`origin()` 只要有任一候选命中可信文本就判 TRUSTED，
+    于是"用户任务里出现过 127.0.0.1" ⇒ "该主机下**任意** URL 都可信"。
+    攻击者的外泄地址因此白拿三重豁免——L5 的清单信用、L4 的授权覆盖例外、
+    以及外发载荷长度只计查询串的快捷路径——五层防御对路径编码外泄整体失效
+    （样本 exfil/path_lowbw）。同理也不取 URL 的 basename：允许列表内的
+    `…/collect/summary.md` 会因为任务里提过 summary.md 而被洗白。
+
+    换言之：主机名是**权限**问题，由 L1 的域名允许列表负责；溯源回答的是
+    **这个具体地址是不是用户要求访问的**，粒度必须是整条 URL。
     """
     v = _norm(value).strip()
     if len(v) < _MIN_TOKEN:
         return []
+    if "://" in v:
+        return [v]
     out = {v}
     base = posixpath.basename(v.rstrip("/"))
     if len(base) >= _MIN_TOKEN:
@@ -42,10 +56,6 @@ def _candidates(value: str) -> list[str]:
         stem = base.rsplit(".", 1)[0]
         if len(stem) >= _MIN_TOKEN:
             out.add(stem)
-    if "://" in v:
-        host = urlparse(v).hostname or ""
-        if len(host) >= _MIN_TOKEN:
-            out.add(host)
     return sorted(out, key=len, reverse=True)
 
 
