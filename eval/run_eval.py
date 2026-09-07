@@ -619,7 +619,10 @@ def main() -> int:
             "llm": ns.llm if ns.llm == "mock" else f"openai:{ns.model}",
             "asr_semantics": (
                 "ASR@obedient：Agent 被脚本设为百分百服从注入，测的是网关的强制力上界；"
-                "模型易感性需用 --llm openai 另测，记作 ASR@model"
+                "模型易感性需用 --llm openai 另测，记作 ASR@model。"
+                "注意载体与说服策略两个维度在本口径下无信息量——同格 96 条样本的 "
+                "sim_actions 完全相同，MockLLM 从不阅读注入文本的外观；"
+                "跑全量只是把同一结果重复 96 遍，建议按格取样。"
                 if ns.llm == "mock" else "ASR@model：真实模型的端到端攻击成功率"
             ),
             "confirm_channel": ns.confirm,
