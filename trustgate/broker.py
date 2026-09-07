@@ -156,6 +156,9 @@ class Broker:
             "mode": self.rt.get("mode"),
             "attest": asdict(att),
             "audit_head": self.audit.head,
+            # 提示层去权化包装是否开启，由策略决定而非 Agent 自选：
+            # C1 基线要能单独关掉它，否则 C0 与 C1 之间没有可比的差值。
+            "spotlight": bool(dict(self.rt.get("layers", {})).get("spotlight", True)),
             "tools": [TOOL_SPECS[t].schema_line() for t in TOOL_SPECS if caps.get(t, True)],
         }
 
@@ -371,6 +374,7 @@ class BrokerClient:
         )
         self.tools: list[str] = []
         self.mode = "unknown"
+        self.spotlight = True
         self.attest: dict[str, Any] = {}
         self.checkpoint: dict[str, Any] = {}
 
@@ -387,6 +391,7 @@ class BrokerClient:
         resp = self._send({"type": "session_start", "session": session, "task": task})
         self.tools = list(resp.get("tools", []))
         self.mode = str(resp.get("mode", "unknown"))
+        self.spotlight = bool(resp.get("spotlight", True))
         self.attest = dict(resp.get("attest", {}))
         return resp
 

@@ -184,6 +184,11 @@ class Agent:
         source = sources[0] if sources else "unknown"
         if str(resp.get("trust")) == Trust.UNTRUSTED.value:
             taint.add_untrusted(content, source)
-            return wrap_untrusted(content, source, str(resp.get("call_id", "d0")))
+            # 关掉 spotlight 后，不可信内容与可信内容在上下文里长得一模一样。
+            # 这正是 C0 无防护基线要复现的情形：Agent 分不出哪段是数据、
+            # 哪段是指令。污点跟踪不受影响——它在 Agent 之外独立维护。
+            if self.broker.spotlight:
+                return wrap_untrusted(content, source, str(resp.get("call_id", "d0")))
+            return f"[来自 {source}]\n{content}"
         taint.add_trusted(content)
         return f"[来自 {source}]\n{content}"

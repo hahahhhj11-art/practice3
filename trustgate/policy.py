@@ -267,7 +267,13 @@ class PolicyEngine:
 
         # 外发参数与本会话读过的敏感内容逐字重合 —— 数据正在离开可信边界。
         # 用内容指纹而非 canary：防御不得依赖只有评测方才知道的秘密。
-        if call.tool != "fs.read" and state.fingerprint.active:
+        #
+        # 只对**外发通道**生效（spec.egress）。早先这里写的是
+        # `call.tool != "fs.read"`，于是 fs.write 也被卷进来：用户明确要求
+        # "把含密码的部署备忘并进摘要"这类任务，写入内容必然与刚读到的敏感
+        # 内容重合，被一律判成数据外带。实测良性任务完成率因此掉到 66.7%，
+        # 直接违反 G6。本地写入不是外泄，它的风险由 L5 计分处理。
+        if spec.egress and state.fingerprint.active:
             threshold = int(self.p.sec("dlp").get("min_matches", MIN_MATCHES))
             for key, val in call.args.items():
                 if isinstance(val, str) and state.fingerprint.leaks(val, threshold):
@@ -281,7 +287,7 @@ class PolicyEngine:
         # 参考上界（默认关闭）：直接用评测 canary 判定。开启后测得的 ASR 是
         # 「防御方预先知道秘密」这一理想情形下的乐观值，只用于给 DLP 指纹
         # 的漏检率提供一个对照基准，绝不能作为主实验结果上报。
-        if self.p.sec("dlp").get("oracle_canary_rule", False) and call.tool != "fs.read":
+        if self.p.sec("dlp").get("oracle_canary_rule", False) and spec.egress:
             for key, val in call.args.items():
                 if isinstance(val, str) and find_canaries(val):
                     return Decision(
@@ -321,9 +327,16 @@ class PolicyEngine:
                     risk=90,
                 )
 
-        # 注入驱动的破坏：会话已污染，且目标是已存在的文件
+        # 注入驱动的破坏：会话已污染，且目标是已存在的文件。
+        #
+        # 例外：调用落在冻结清单内、且目标路径能溯源到用户任务。这种覆盖
+        # 正是用户亲口要求的事（"把摘要写到 out/summary.md"，而该文件上次
+        # 就已生成），再弹确认框纯属噪声。少了这条例外，任何"更新我上次的
+        # 输出"型任务都会 100% 触发确认——安全机制把常规工作流做废，
+        # 是比漏拦一次攻击更容易葬送方案的失败模式（G6）。
         if state.taint.session_tainted and TOOL_SPECS[call.tool].irreversible:
-            if meta.get("target_exists"):
+            authorized = bool(meta.get("in_manifest")) and meta.get("trust") == "trusted"
+            if meta.get("target_exists") and not authorized:
                 return Decision(
                     "confirm",
                     "L4.tainted_destructive",
@@ -370,7 +383,11 @@ class PolicyEngine:
             in_manifest = _within_manifest(call, state, meta)
             meta["in_manifest"] = in_manifest
 
-        if in_manifest and trust == "trusted":
+        # 「用户授权过」这件事：调用落在冻结清单内，且选择目标的参数能溯源
+        # 到用户任务本身。下面几笔加减都以它为轴。
+        authorized = bool(in_manifest) and trust == "trusted"
+
+        if authorized:
             risk -= int(rcfg.get("manifest_credit", 40))
         elif in_manifest:
             risk -= int(rcfg.get("manifest_credit_weak", 20))
@@ -379,10 +396,32 @@ class PolicyEngine:
             risk += int(rcfg.get("untrusted_penalty", 40))
         elif trust == "unknown":
             risk += int(rcfg.get("unknown_penalty", 15))
-        if state.taint.session_tainted:
+
+        # 会话被污染这一事实，不改变已授权调用的授权状态。
+        #
+        # 清单是在任何外部内容进入上下文**之前**冻结的，所以清单内、参数
+        # 又溯源自用户任务的调用，其授权早于污染成立，事后出现的不可信内容
+        # 不该反过来给它加分。少了这条区分，惩罚项会累加到恰好触线：
+        # 60 − 40（清单信用）+ 10（会话污染）+ 20（覆盖既存/敏感写入）= 50，
+        # 正好是 confirm 阈值——于是"更新我上次的摘要"这类任务 100% 弹确认框，
+        # 实测 BTC 掉到 66.7%，违反 G6。
+        if state.taint.session_tainted and not authorized:
             risk += int(rcfg.get("tainted_session_penalty", 10))
         if spec.irreversible and meta.get("target_exists"):
             risk += int(rcfg.get("overwrite_penalty", 20))
+
+        # 把敏感内容落到本地文件：不是外泄（L3 已按 egress 收窄），但确实是
+        # 一次敏感数据扩散，按比例加分而不是直接拒绝。落在清单内又溯源可信的
+        # 写入仍在允许区间；一旦授权关系变弱，同样的动作就会升级为需要确认。
+        # 这条是"比例原则"的落点：证据强度决定处置强度，而不是一刀切。
+        if spec.irreversible and not spec.egress and state.fingerprint.active:
+            content = str(call.args.get("content", ""))
+            if content and state.fingerprint.leaks(
+                content, int(self.p.sec("dlp").get("min_matches", MIN_MATCHES))
+            ):
+                risk += int(rcfg.get("sensitive_local_write_penalty", 20))
+                meta["sensitive_local_write"] = True
+
         risk = max(risk, 0)
         meta["risk"] = risk
 
