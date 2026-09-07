@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+
+# 运行产物：可重新生成，不进版本库
+logs/
+sandbox/
+.trustgate/
+
+# 攻击样本由 attacks/generate.py 确定性生成（480 个文件），
+# 只跟踪生成器本身，避免仓库被上千个小文件淹没。
+attacks/corpus/
+attacks/samples/
