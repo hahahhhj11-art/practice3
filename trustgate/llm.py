@@ -92,6 +92,21 @@ def _extract_secret(text: str) -> str:
     return m.group(1) if m else ""
 
 
+def _saw_trigger(history: list[Turn], trigger: str) -> bool:
+    """观察内容里是否出现了指定的触发文本。
+
+    用于持久化注入的**第二阶段**：新会话里没有 `web.read`，不可信内容是从
+    一个此前被投毒的文件里读回来的，因此"是否已被注入触及"只能以毒文本
+    本身是否进入上下文为判据。
+
+    判据落在攻击者写下的内容上，而不落在任何防御机制的产物上（比如
+    `<UNTRUSTED_DATA>` 包装或溯源标签），因此不会随实验组开关而漂移——
+    这正是 `_saw_external_content` 当初刻意绕开 spotlight 标记的同一条理由。
+    """
+    needle = trigger.lower()
+    return any(t.role == "observation" and needle in t.content.lower() for t in history)
+
+
 def _saw_external_content(history: list[Turn]) -> bool:
     """本会话是否已成功读入外部内容 —— 即"是否已被注入触及"。
 
@@ -167,6 +182,10 @@ class MockLLM(LLMBackend):
     # 两者在无防护基线下都会测出 ASR=0，让人误以为防御有效——实际是样本
     # 无效。攻击者当然会等到数据到手、或等到任务写完再动手。
     inject_after: int = 1
+    # 注入动作的触发方式。留空则以"已成功读入外部网页"为判据（默认，适用于
+    # 一次性注入）；置为某段文本则以"该文本出现在观察内容里"为判据，用于
+    # 持久化注入的第二阶段——毒文本来自被投毒的本地文件，不来自网页。
+    trigger: str = ""
     _cursor: int = 0
     _inj_cursor: int = 0
     _resolved: dict[str, Any] | None = None
@@ -182,7 +201,10 @@ class MockLLM(LLMBackend):
 
     def act(self, task: str, tools: list[str], plan: str, history: list[Turn]) -> dict[str, Any]:
         s = self._s(task)
-        tainted = _saw_external_content(history)
+        tainted = (
+            _saw_trigger(history, self.trigger) if self.trigger
+            else _saw_external_content(history)
+        )
 
         # 模拟被间接提示注入劫持：条件满足后优先执行注入要求的动作
         ready = tainted and self._cursor >= self.inject_after

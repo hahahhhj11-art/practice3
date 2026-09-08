@@ -64,6 +64,7 @@
     "tainted_session_penalty": 10,
     "overwrite_penalty": 20,
     "sensitive_local_write_penalty": 20,
+    "persistence_penalty": 15,
     "manifest_credit": 40,
     "manifest_credit_weak": 20,
     "_note": "manifest_credit 是良性任务可用性的关键参数：没有它，fs.write 的基础风险 60 会让每次写文件都弹确认框。见 policy.py::_l5_risk。"
