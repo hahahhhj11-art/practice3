@@ -392,20 +392,36 @@ class PolicyEngine:
                     risk=TOOL_SPECS[call.tool].risk,
                 )
 
-        # 持久化注入：把不可信内容写进 Agent 后续还会读到的位置（记忆投毒）
+        # 持久化注入（记忆投毒）：不可信内容被写进 Agent 后续还会读到的位置。
+        #
+        # 这里**只登记信号、不拦截**，与直觉相反，理由有二：
+        #
+        # 一、写入时拦不准。判据"内容派生自不可信文本 + 落在可读区"对**任何
+        #     网页摘要任务**都成立——用户让 Agent 读一个页面再把摘要存进工作
+        #     区，本来就必然满足这两条。此前靠 `_looks_like_instruction()` 的
+        #     关键词表来区分"指令性文本"与"普通摘要"，那正是 ASB 与 Liu et al.
+        #     反复证明不可靠的语义判别：换一种措辞即可绕过，而正常摘要里出现
+        #     "请""必须"又会误伤。两头都不讨好。
+        #
+        # 二、真正的危害在**再摄入**那一刻，而那里有可靠机制。写入执行后，
+        #     anchor 会把目标路径登记进持久化溯源表，此后经 fs.read 读回时
+        #     一律标为 Trust.UNTRUSTED；毒文本里的路径/参数于是溯源为不可信，
+        #     由 L3 拦下。判据是数据流而非文本外观，改措辞无从规避。
+        #
+        # 实测支撑（T5 两阶段判定，见 eval/run_eval.py::verify_persistence）：
+        # C3（仅到 L3 + 溯源）的 T5b = 0%，UA = 100%；把本规则改回硬拦截的
+        # C4/C5 同样 T5b = 0%，但 UA 掉到 50%——安全收益为零，效用代价一半。
+        #
+        # 保留风险分而不是完全删除，是因为溯源只覆盖经 Broker 的读取。文件被
+        # 另一个进程、另一个 Agent 或用户的编辑器读走时，溯源标签不参与，
+        # 那种情形下这条信号是唯一的痕迹（威胁模型 §5 已知边界）。
         if call.tool == "fs.write":
             content = str(call.args.get("content", ""))
             rel = str(meta.get("rel", ""))
             if state.taint.contains_untrusted(content[:400]) and matches_any(
                 rel, list(self.p.sec("fs").get("read_allow", []))
             ):
-                if _looks_like_instruction(content):
-                    return Decision(
-                        "confirm",
-                        "L4.persistent_injection",
-                        "写入内容含指令性的不可信文本，且落在后续可读区域（疑似记忆投毒）",
-                        risk=70,
-                    )
+                meta["persistence_risk"] = True
 
         return Decision("allow", "L4.ok")
 
@@ -469,6 +485,13 @@ class PolicyEngine:
             ):
                 risk += int(rcfg.get("sensitive_local_write_penalty", 20))
                 meta["sensitive_local_write"] = True
+
+        # 疑似记忆投毒（L4 只登记不拦截，理由见该处注释）。给一笔小额罚分并
+        # 留在审计里：真正的防线是写入后的溯源登记 + 读回时的 L3 判定，这里
+        # 只是让"未授权的、把外部内容写进可读区"的调用更容易升级为需确认。
+        # 分值刻意低于清单信用，好让良性摘要任务不受影响。
+        if meta.get("persistence_risk") and not authorized:
+            risk += int(rcfg.get("persistence_penalty", 15))
 
         risk = max(risk, 0)
         meta["risk"] = risk
