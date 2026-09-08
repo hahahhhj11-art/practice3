@@ -523,12 +523,9 @@ def _within_manifest(call: ToolCall, state: SessionState, meta: dict[str, Any]) 
     return True
 
 
-_INSTRUCTION_HINTS = (
-    "ignore previous", "system", "指令", "请立即", "must", "你必须",
-    "instruction", "忽略", "assistant", "tool", "发送到", "上传",
-)
-
-
-def _looks_like_instruction(text: str) -> bool:
-    low = text.lower()
-    return sum(1 for h in _INSTRUCTION_HINTS if h.lower() in low) >= 2
+# 这里原有一张 `_INSTRUCTION_HINTS` 关键词表与 `_looks_like_instruction()`，
+# 用于判断一段文本"像不像指令"。已随 L4 记忆投毒规则的降级一并删除，而不是
+# 留着备用——那类基于文本外观的语义判别是 ASB 与 Liu et al. 反复证明不可靠
+# 的路子（换个措辞即绕过，正常摘要里出现"必须"又误伤），留在文件里只会诱使
+# 后来者重新接上。判断"内容是否源自不可信文本"请用 taint.derived_from_untrusted，
+# 判据是数据流而非外观。
