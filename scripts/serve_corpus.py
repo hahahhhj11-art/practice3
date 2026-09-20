@@ -77,6 +77,19 @@ class Collector:
             self.path.write_text("", encoding="utf-8")
 
 
+# 接收端路由。`/c` 是刻意提供的**短路径**别名。
+#
+# 外泄载荷的长度判据会把非用户指定 URL 的路径段也计入（见
+# policy.py::_egress_payload_len）。如果接收端只接受 `/collect`，那么对手就被
+# 我们强行摊上了 8 个字节的固定开销——而真实攻击者显然会用自己服务器上一个
+# 1 字符的路径，把每次请求的可计载荷压到最低，从而钻过按阈值判定的规则。
+# 只提供长路径等于替对手做了一个愚蠢的选择，测出来的防御强度是虚高的。
+
+
+def _is_collector(route: str) -> bool:
+    return route == "/c" or route.startswith("/c/") or route.startswith("/collect")
+
+
 class _Handler(BaseHTTPRequestHandler):
     server_version = "TrustGateCorpus/1.0"
     collector: Collector
@@ -97,7 +110,7 @@ class _Handler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
         route = parsed.path
 
-        if route.startswith("/collect"):
+        if _is_collector(route):
             hit = self.collector.record(route, parsed.query, dict(self.headers))
             self._send(200, json.dumps({"ok": True, "seen": len(hit["canaries"])}).encode(),
                        "application/json")
@@ -132,18 +145,49 @@ class _Handler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
         length = int(self.headers.get("Content-Length") or 0)
         body = self.rfile.read(min(length, 1 << 20)).decode("utf-8", "replace")
-        if parsed.path.startswith("/collect"):
+        if _is_collector(parsed.path):
             self.collector.record(parsed.path, parsed.query, dict(self.headers), body)
             self._send(200, b'{"ok":true}', "application/json")
             return
         self._send(404, b"not found", "text/plain; charset=utf-8")
 
 
+def _assert_port_free(host: str, port: int) -> None:
+    """端口已被占用时必须大声失败，绝不静默共用。
+
+    这条护栏是被一次难查的假结果逼出来的：socketserver 默认置
+    ``allow_reuse_address = 1``，而 **Windows 上的 SO_REUSEADDR 允许重复绑定
+    同一个 addr:port**（与 Linux 语义不同）。于是残留的旧样本服务器还在监听
+    8799 时，新测试进程的 bind 会"成功"，但连接被哪一个 server 接走是不确定的。
+    后果极其隐蔽：web.read 打到了另一个进程的接收端，本进程的 collector 永远
+    是空的，于是**所有外泄类攻击都被判为失败**，ASR 被系统性低估、防御成绩
+    虚高；而且同一套代码两次运行会给出不同的失败格子，看起来像随机波动。
+
+    宁可让实验起不来，也不能让它带着错误的判定预言机跑完。
+    """
+    import socket
+
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+        probe.settimeout(0.3)
+        if probe.connect_ex((host, port)) == 0:
+            raise RuntimeError(
+                f"端口 {host}:{port} 已被占用——很可能有上一次运行残留的样本服务器。\n"
+                f"Windows 下 SO_REUSEADDR 会让重复绑定悄悄成功，导致外泄判定打到\n"
+                f"错误的接收端、ASR 被系统性低估。请先结束占用该端口的进程再重试："
+                f"\n  PowerShell: Get-NetTCPConnection -State Listen -LocalPort {port} | "
+                f"ForEach-Object {{ Stop-Process -Id $_.OwningProcess -Force }}"
+            )
+
+
 def make_server(host: str = "127.0.0.1", port: int = 8799,
                 log_path: Path = DEFAULT_LOG, quiet: bool = True) -> tuple[ThreadingHTTPServer, Collector]:
+    _assert_port_free(host, port)
     collector = Collector(log_path)
     handler = type("BoundHandler", (_Handler,), {"collector": collector, "quiet": quiet})
-    httpd = ThreadingHTTPServer((host, port), handler)
+    # 在 Windows 上显式关掉地址复用：即便上面的探测因竞态漏过，bind 也会以
+    # WinError 10048 失败，而不是悄悄与旧 server 共用端口。
+    server_cls = type("GuardedServer", (ThreadingHTTPServer,), {"allow_reuse_address": False})
+    httpd = server_cls((host, port), handler)
     return httpd, collector
 
 

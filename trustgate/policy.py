@@ -353,8 +353,33 @@ class PolicyEngine:
         # 外泄链：曾读到敏感内容 → 随后发起可携带数据的外发请求。
         # 判据用 egress_len 而非 query_len：见 _egress_payload_len 的说明，
         # 只看查询串会被"把碎片编进 URL 路径"整体绕过。
+        #
+        # 目的地判据优先于长度判据。原先这条规则只看 egress_len 是否达到
+        # min_query_len_for_chain（默认 8），那是一个**对手可标定的阈值**：
+        # 只要知道这个数，就把凭据切成 3 字节碎片、再配一个 1 字符路径的接收端
+        # （`/c?a=XXX` 的可计载荷仅 7 字节），链判据便永不触发；碎片同时短于
+        # L3 指纹的 16 字符窗口，累计量又远低于会话预算——L1/L3/L4 一起失效。
+        # 把阈值调小治不了本：对手照样可以再切细一格。带宽类判据天生输给
+        # "愿意发得更慢"的对手。
+        #
+        # 改成问一个对手无法标定的问题：**这个外发地址是不是用户亲口指定的**。
+        # 溯源为 TRUSTED 意味着整条 URL 逐字出现在用户任务里，因此其中不可能
+        # 夹带攻击者的载荷（往 URL 上追加任何查询串都会让它不再精确命中）。
+        # 会话一旦触及敏感内容，就只允许发往这种地址；其余一律拒绝，与载荷
+        # 多长无关。代价是 Agent 不能再去访问"读敏感文件之后才发现的链接"，
+        # 这个效用损失如实计入 UA。
         if call.tool == "web.read" and state.sensitive_seen:
             elen = int(meta.get("egress_len", 0))
+            url = str(call.args.get("url", ""))
+            dest_trusted = state.taint.origin(url) is Trust.TRUSTED
+            if bool(ex.get("require_trusted_dest_after_sensitive", True)) and not dest_trusted:
+                return Decision(
+                    "deny",
+                    "L4.exfil_chain",
+                    f"检测到外泄链：本会话曾读取敏感内容，现发起指向非用户指定地址的外发请求"
+                    f"（可控载荷 {elen} 字节）",
+                    risk=100,
+                )
             if elen >= int(ex.get("min_query_len_for_chain", 8)):
                 return Decision(
                     "deny",

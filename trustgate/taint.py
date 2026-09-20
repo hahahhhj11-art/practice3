@@ -26,37 +26,53 @@ def _norm(s: str) -> str:
     return normalize_text(str(s)).replace("\\", "/").lower()
 
 
-def _candidates(value: str) -> list[str]:
-    """为一个参数值生成用于溯源的字符串候选集。
+def _candidate_sets(value: str) -> tuple[list[str], list[str]]:
+    """为一个参数值生成溯源候选集，并区分**精确**与**宽松**两档。
 
-    对**文件路径**，除完整值外还包括 basename 与不含扩展名的主干——因为
-    Agent 常常只从文本里拿到文件名，再自行拼接出完整路径，这种宽松匹配
-    是必要的。
+    返回 (exact, loose)。这个区分是安全性的关键，不是代码整洁问题：
 
-    对 **URL** 则刻意只用完整值。早先这里额外把裸主机名放进候选集，那是
-    一个可利用的洗白通道：`origin()` 只要有任一候选命中可信文本就判 TRUSTED，
-    于是"用户任务里出现过 127.0.0.1" ⇒ "该主机下**任意** URL 都可信"。
-    攻击者的外泄地址因此白拿三重豁免——L5 的清单信用、L4 的授权覆盖例外、
-    以及外发载荷长度只计查询串的快捷路径——五层防御对路径编码外泄整体失效
-    （样本 exfil/path_lowbw）。同理也不取 URL 的 basename：允许列表内的
-    `…/collect/summary.md` 会因为任务里提过 summary.md 而被洗白。
+    · exact —— 完整归一化后的值。只有它命中可信文本才足以判 TRUSTED，
+      因为只有它能回答"用户要的就是**这一个**对象"。
+    · loose —— 文件路径的 basename 与不含扩展名的主干。保留它是因为 Agent
+      常常只从文本里拿到一个文件名再自行拼出完整路径，一刀切成 UNTRUSTED
+      会误杀大量正常任务。但它**最多只能得到 UNKNOWN**。
 
-    换言之：主机名是**权限**问题，由 L1 的域名允许列表负责；溯源回答的是
-    **这个具体地址是不是用户要求访问的**，粒度必须是整条 URL。
+    为什么 loose 不能给 TRUSTED：basename 匹配是一条可利用的洗白通道。
+    用户任务里出现 `…/out/summary.md`，攻击者便指向同名但**不同目录**的
+    `…/project/summary.md`——完整路径只存在于注入内容里，却因为同名被判
+    TRUSTED，于是 L3 的 untrusted_irreversible 完全不触发，破坏性覆盖畅通。
+    现实中 readme.md / notes.md / config.json 这类文件名遍地都是，攻击者
+    几乎总能找到一个同名受害者。这与此前修掉的 URL 主机名洗白是同一类
+    错误：把「同类」当成了「同一个」。
+    降级为 UNKNOWN 之后，宽松匹配仍不被硬拒，但必须另外命中能力清单才能
+    通过——这正是三值格里 UNKNOWN 一档当初被设计出来的用途。
+
+    URL 刻意不产生任何 loose 候选。早先把裸主机名放进候选集，等于宣称
+    "任务里出现过 127.0.0.1" ⇒ "该主机下任意 URL 都可信"，攻击者的外泄地址
+    因此白拿三重豁免（L5 清单信用、L4 授权覆盖例外、外发长度只计查询串的
+    快捷路径），五层防御对路径编码外泄整体失效（样本 exfil/path_lowbw）。
+    主机名是**权限**问题，归 L1 的域名允许列表管；溯源回答的是**这个具体
+    地址是不是用户要求访问的**，粒度必须是整条 URL。
     """
     v = _norm(value).strip()
     if len(v) < _MIN_TOKEN:
-        return []
+        return [], []
     if "://" in v:
-        return [v]
-    out = {v}
+        return [v], []
+    loose: set[str] = set()
     base = posixpath.basename(v.rstrip("/"))
-    if len(base) >= _MIN_TOKEN:
-        out.add(base)
+    if len(base) >= _MIN_TOKEN and base != v:
+        loose.add(base)
         stem = base.rsplit(".", 1)[0]
         if len(stem) >= _MIN_TOKEN:
-            out.add(stem)
-    return sorted(out, key=len, reverse=True)
+            loose.add(stem)
+    return [v], sorted(loose, key=len, reverse=True)
+
+
+def _candidates(value: str) -> list[str]:
+    """全部候选（精确 + 宽松）。仅用于「是否被不可信内容提及」这类悲观判定。"""
+    exact, loose = _candidate_sets(value)
+    return exact + loose
 
 
 @dataclass
@@ -103,15 +119,25 @@ class TaintTracker:
             self.add_trusted(text)
 
     def origin(self, value: object) -> Trust:
-        """三值溯源判定。unknown 的处置交由策略层决定（要求命中 Manifest）。"""
+        """三值溯源判定。unknown 的处置交由策略层决定（要求命中 Manifest）。
+
+        判定次序有讲究：
+        1. **精确**命中可信文本 → TRUSTED。哪怕攻击者也提到了同一个路径也不
+           降级，否则对手只要在网页里复述一遍用户的目标文件，就能让正常任务
+           失败——那是一条免费的拒绝服务。
+        2. 任一候选（含 basename）命中不可信文本 → UNTRUSTED。这一步取悲观：
+           攻击者提过的名字，宁可当脏的。
+        3. 仅**宽松**命中可信文本 → UNKNOWN。同名不等于同一个对象，详见
+           `_candidate_sets` 对洗白通道的说明。
+        """
         if not isinstance(value, str):
             return Trust.TRUSTED
-        cands = _candidates(value)
-        if not cands:
+        exact, loose = _candidate_sets(value)
+        if not exact:
             return Trust.TRUSTED
-        if any(c in self._trusted_blob for c in cands):
+        if any(c in self._trusted_blob for c in exact):
             return Trust.TRUSTED
-        if any(c in self._untrusted_blob for c in cands):
+        if any(c in self._untrusted_blob for c in exact + loose):
             return Trust.UNTRUSTED
         return Trust.UNKNOWN
 
