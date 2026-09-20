@@ -78,7 +78,9 @@
 
   "exfil": {
     "session_query_budget": 256,
-    "min_query_len_for_chain": 8
+    "min_query_len_for_chain": 8,
+    "require_trusted_dest_after_sensitive": true,
+    "_note": "会话触及敏感内容后，只允许发往用户亲口指定的地址。这条不设长度阈值是有意的：任何带宽阈值都可被对手标定（切更细的碎片 + 1 字符路径的接收端即可绕过），而「地址是不是用户要求的」无法标定。见 policy.py 中 L4.exfil_chain。"
   },
 
   "manifest": {
