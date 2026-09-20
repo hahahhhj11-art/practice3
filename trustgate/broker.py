@@ -1,12 +1,22 @@
 """Tool Broker：策略执行点 PEP + 工具执行体。
 
-本进程是系统里唯一持有文件系统与网络权限的组件。Agent 进程只能通过
-stdio 上的 JSON Lines 通道向这里提出请求，因此策略无法被旁路
-（设计原则 P1 完全仲裁，见 docs/02-系统架构.md §2）。
+本进程持有文件系统与网络权限，Agent 只能通过 stdio 上的 JSON Lines 通道
+向这里提出请求。但要注意：「Agent 绕不过来」这件事**不是本文件能保证的**，
+它取决于两个进程谁是谁的父进程、以及 Agent 那一侧有没有被内核剥权：
+
+  S0（BrokerClient）        Agent 是父进程、Broker 是子进程。Agent 持有用户
+                            全部权限，一行 open() 就绕过了整条策略链。此档
+                            **不满足**完全仲裁，只用作对照与延迟下界。
+  S1/S2（Supervisor）       特权父进程持有 Broker，Agent 是被剥权的子进程。
+                            S2 下由 Landlock + seccomp 在内核层切断绕过路径，
+                            完全仲裁才真正成立。见 trustgate/confine.py 与
+                            trustgate/supervisor.py。
+
+设计原则 P1（完全仲裁）见 docs/02-系统架构.md §2。
 
 两种运行形态：
-  python -m trustgate.broker --serve   作为子进程被 Agent 拉起
-  BrokerClient(...)                    Agent 侧的客户端封装
+  python -m trustgate.broker --serve   作为子进程被 Agent 拉起（S0）
+  Broker(...).handle(msg)              由 Supervisor 在特权侧直接驱动（S1/S2）
 
 mode=observe 时，判定照常执行并写入审计日志，但不拦截——用于采集
 C0 无防护基线，且日志格式与 enforce 模式完全一致，可直接对比。
@@ -92,7 +102,13 @@ class Broker:
         audit_path: str = "logs/audit.jsonl",
         confirm: str = "tty",
         key_source: str | None = None,
+        expose_key: bool = False,
     ):
+        # 审计验证密钥绝不应该走 Agent 那条通道出去。Agent 是不可信的：它一旦
+        # 拿到 HMAC 密钥，就能把整条哈希链重签一遍，SC4 防篡改直接失效。
+        # 正确的取密钥方是特权侧（Supervisor 直接问锚），而不是被仲裁的一方。
+        # 这里保留开关只为兼容 S0 对照组——那一档本来就不提供任何隔离保证。
+        self.expose_key = expose_key
         self.anchor = make_anchor(anchor_kind, policy_path, key_source)
         # 配置只从锚取，绝不自己去读 policy.json：Broker 与锚各读一遍磁盘，
         # 等于给对手 A2 留了一个只需改一个字段就能整体关停网关的开关。
@@ -131,6 +147,8 @@ class Broker:
                 "checkpoint": self.anchor.chain_checkpoint(),
             }
         if kind == "export_key":
+            if not self.expose_key:
+                return {"type": "error", "error": "本通道不提供审计密钥导出（仅特权侧可取）"}
             return {"type": "key", "key": self.anchor.export_key()}
         return {"type": "error", "error": f"未知消息类型 {kind}"}
 
@@ -326,7 +344,10 @@ class Broker:
 
 
 def _serve(ns: argparse.Namespace) -> None:
-    broker = Broker(ns.anchor, ns.policy, ns.audit, ns.confirm, ns.key_source)
+    broker = Broker(
+        ns.anchor, ns.policy, ns.audit, ns.confirm, ns.key_source,
+        expose_key=bool(getattr(ns, "expose_key", False)),
+    )
     try:
         for line in sys.stdin:
             line = line.strip()
@@ -344,49 +365,40 @@ def _serve(ns: argparse.Namespace) -> None:
 
 # ---------------------------------------------------------------- Agent 侧客户端
 
-class BrokerClient:
-    """Agent 进程中对 Broker 的封装。Agent 只能看见这个窄接口。"""
+class BrokerChannel:
+    """Agent 侧看到的窄接口。收发流由子类提供，上层协议完全共用。
 
-    def __init__(
-        self,
-        anchor: str = "T1",
-        policy: str = "policy.json",
-        audit: str = "logs/audit.jsonl",
-        confirm: str = "tty",
-        key_source: str = "file",
-    ):
-        child_env = os.environ.copy()
-        child_env["PYTHONUTF8"] = "1"
-        self.proc = subprocess.Popen(
-            [
-                sys.executable, "-m", "trustgate.broker", "--serve",
-                "--anchor", anchor, "--policy", policy,
-                "--audit", audit, "--confirm", confirm,
-                "--key-source", key_source,
-            ],
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=None,
-            cwd=str(project_root()),
-            env=child_env,
-            text=True,
-            encoding="utf-8",
-            bufsize=1,
-        )
+    两种接法对应两种进程拓扑：
+      · BrokerClient          Agent 是父进程，自己拉起 Broker 子进程。
+        这是 S0 对照档——Agent 持有用户全部权限，随时可以不经 Broker 直接
+        open()/socket()，「完全仲裁」在此档**不成立**，仅用于测延迟下界。
+      · AttachedBrokerClient  Agent 是被剥权的子进程，管道由特权父进程建好。
+        工具能力物理上不在本进程内，绕过路径由内核切断（见 confine.py）。
+    """
+
+    def __init__(self) -> None:
         self.tools: list[str] = []
         self.mode = "unknown"
         self.spotlight = True
         self.attest: dict[str, Any] = {}
         self.checkpoint: dict[str, Any] = {}
 
+    # 子类必须提供 (读流, 写流)
+    def _streams(self) -> tuple[TextIO, TextIO]:
+        raise NotImplementedError
+
     def _send(self, msg: dict[str, Any]) -> dict[str, Any]:
-        assert self.proc.stdin and self.proc.stdout
-        self.proc.stdin.write(json.dumps(msg, ensure_ascii=False) + "\n")
-        self.proc.stdin.flush()
-        line = self.proc.stdout.readline()
+        r, w = self._streams()
+        w.write(json.dumps(msg, ensure_ascii=False) + "\n")
+        w.flush()
+        line = r.readline()
         if not line:
-            raise RuntimeError("Broker 进程已退出")
+            raise RuntimeError("Broker 通道已关闭")
         return json.loads(line)
+
+    def request(self, msg: dict[str, Any]) -> dict[str, Any]:
+        """发一条通道消息并取回应答。供宿主层（报到、模型代办）复用同一条管道。"""
+        return self._send(msg)
 
     def session_start(self, session: str, task: str) -> dict[str, Any]:
         resp = self._send({"type": "session_start", "session": session, "task": task})
@@ -411,20 +423,90 @@ class BrokerClient:
             return {}
 
     def export_key(self) -> str:
-        """取回审计验证密钥。ephemeral 模式下 Broker 一退出这把密钥就消失，
-        校验方必须在会话期间取走——这正是 T1 相对 T2 的能力缺口所在。"""
+        """取回审计验证密钥。
+
+        注意这条路径在新拓扑下**会被 Broker 拒绝**，这是有意的：Agent 不可信，
+        拿到 HMAC 密钥就能重签整条哈希链。特权侧（Supervisor）直接向锚索取，
+        不经过这个通道。ephemeral 模式下 Broker 一退出密钥即消失，校验方必须
+        在会话期间取走——这正是 T1 相对 T2 的能力缺口所在。
+        """
         try:
             return str(self._send({"type": "export_key"}).get("key", ""))
         except Exception:
             return ""
 
     def close(self) -> None:
+        pass
+
+
+class BrokerClient(BrokerChannel):
+    """S0 对照档：Agent 作为父进程自行拉起 Broker 子进程。
+
+    保留它不是为了当主架构用，而是实验里必须有一个「没有任何隔离」的参照点：
+    没有 S0 的数字，就无法证明 S2 拦下的绕过路径原本确实走得通。
+    """
+
+    def __init__(
+        self,
+        anchor: str = "T1",
+        policy: str = "policy.json",
+        audit: str = "logs/audit.jsonl",
+        confirm: str = "tty",
+        key_source: str = "file",
+        allow_key_export: bool = False,
+    ):
+        super().__init__()
+        child_env = os.environ.copy()
+        child_env["PYTHONUTF8"] = "1"
+        argv = [
+            sys.executable, "-m", "trustgate.broker", "--serve",
+            "--anchor", anchor, "--policy", policy,
+            "--audit", audit, "--confirm", confirm,
+            "--key-source", key_source,
+        ]
+        if allow_key_export:
+            argv.append("--expose-key")
+        self.proc = subprocess.Popen(
+            argv,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=None,
+            cwd=str(project_root()),
+            env=child_env,
+            text=True,
+            encoding="utf-8",
+            bufsize=1,
+        )
+
+    def _streams(self) -> tuple[TextIO, TextIO]:
+        assert self.proc.stdin and self.proc.stdout
+        return self.proc.stdout, self.proc.stdin
+
+    def close(self) -> None:
         try:
             if self.proc.stdin:
                 self.proc.stdin.close()
+            if self.proc.stdout:
+                self.proc.stdout.close()
             self.proc.wait(timeout=5)
         except Exception:
             self.proc.kill()
+
+
+class AttachedBrokerClient(BrokerChannel):
+    """S1/S2 档：Agent 是被剥权的子进程，管道由特权父进程建好后交下来。
+
+    本进程内**没有**任何工具实现，也没有文件系统与网络权限；这个对象是
+    Agent 唯一的对外出口。它不 spawn 任何东西，生命周期由父进程掌握。
+    """
+
+    def __init__(self, read_stream: TextIO, write_stream: TextIO):
+        super().__init__()
+        self._r = read_stream
+        self._w = write_stream
+
+    def _streams(self) -> tuple[TextIO, TextIO]:
+        return self._r, self._w
 
 
 if __name__ == "__main__":
@@ -435,6 +517,11 @@ if __name__ == "__main__":
     ap.add_argument("--audit", default="logs/audit.jsonl")
     ap.add_argument("--confirm", default="tty", choices=["tty", "deny", "allow"])
     ap.add_argument("--key-source", default="file", choices=["file", "ephemeral", "env"])
+    ap.add_argument(
+        "--expose-key",
+        action="store_true",
+        help="允许经本通道导出审计密钥；仅 S0 对照档使用，正式拓扑下不得开启",
+    )
     ns = ap.parse_args()
     if ns.serve:
         _serve(ns)
