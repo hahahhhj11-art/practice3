@@ -116,6 +116,13 @@ class Broker:
         self.audit = AuditLog(project_root() / audit_path, chain_fn=self.anchor.chain_append)
         self.confirm = ConfirmChannel(confirm)
         self.session = ""
+        # 取证捕获默认关闭，且必须显式在策略里打开。
+        #
+        # 关掉是默认值而不是遗漏：审计日志刻意只存 args_digest 不存原文，正是
+        # 为了不让审计本身变成敏感数据的第二个泄露点。取证要的恰恰是原文，
+        # 所以它天生与那条设计相冲突——开了就等于在磁盘上多留一份未脱敏副本。
+        # 因此它是一个知情选择，而不是顺手就有的功能。
+        self._forensics = dict(self.rt.get("forensics", {}))
 
     @property
     def enforcing(self) -> bool:
@@ -285,6 +292,8 @@ class Broker:
             latency_ms=latency_ms,
         )
 
+        self._capture_forensics(call, result, verdict_effective, rule, reason)
+
         return {
             "v": PROTOCOL_VERSION,
             "type": "tool_result",
@@ -304,6 +313,52 @@ class Broker:
             "truncated": result.truncated,
             "latency_ms": latency_ms,
         }
+
+    def _capture_forensics(
+        self, call: ToolCall, result: ToolResult, verdict: str, rule: str, reason: str
+    ) -> None:
+        """把取证层需要的原始素材另存一份。完全在判定之外，不影响任何裁决。
+
+        只记两类记录：
+          ingest     进入过上下文的不可信内容（定位的搜索空间）
+          violation  被判为不允许的调用及其**参数原值**（定位的痕迹来源）
+        审计日志里这两样都只有摘要，取证无法从摘要反查，所以必须另开一路。
+        写失败一律吞掉：取证是事后分析设施，绝不能因为它落盘失败而影响一次
+        正常的工具调用——安全设施把主流程搞挂，比缺少取证材料严重得多。
+        """
+        if not self._forensics.get("capture"):
+            return
+        records: list[dict[str, Any]] = []
+        if result.ok and result.trust == Trust.UNTRUSTED and result.content:
+            records.append({
+                "kind": "ingest",
+                "step": call.step,
+                "call_id": call.call_id,
+                "source": result.sources[0] if result.sources else "unknown",
+                "content": result.content[: int(self._forensics.get("max_chars", 20000))],
+            })
+        if verdict != "allow":
+            records.append({
+                "kind": "violation",
+                "step": call.step,
+                "call_id": call.call_id,
+                "tool": call.tool,
+                "rule": rule,
+                "reason": reason,
+                # 参数原值是定位的输入：违规调用的路径 / URL / 待写内容正是
+                # 攻击在数据流上留下的痕迹，摘要化之后就无从反查了。
+                "args": {k: (v[:2000] if isinstance(v, str) else v) for k, v in call.args.items()},
+            })
+        if not records:
+            return
+        try:
+            out = project_root() / str(self._forensics.get("dir", "logs/forensics"))
+            out.mkdir(parents=True, exist_ok=True)
+            with (out / f"{self.session or 'nosession'}.jsonl").open("a", encoding="utf-8") as fh:
+                for rec in records:
+                    fh.write(json.dumps({"session": self.session, **rec}, ensure_ascii=False) + "\n")
+        except Exception:
+            pass
 
     def _execute(
         self, call: ToolCall, fs_cfg: dict[str, Any], root: str, decision_meta: dict[str, Any]

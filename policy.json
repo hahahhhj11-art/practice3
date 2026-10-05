@@ -86,5 +86,12 @@
   "manifest": {
     "require_frozen": true,
     "max_steps_cap": 12
+  },
+
+  "forensics": {
+    "capture": false,
+    "dir": "logs/forensics",
+    "max_chars": 20000,
+    "_note": "默认关闭是知情选择而非遗漏：审计日志刻意只存 args_digest 不存原文，以免审计本身成为敏感数据的第二个泄露点；取证要的恰恰是原文，开启即等于在磁盘上多留一份未脱敏副本。开启后 scripts/forensics_report.py 可对会话做注入定位与来源归因。"
   }
 }
