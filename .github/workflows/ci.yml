@@ -1,0 +1,163 @@
+# TrustGate 自检流水线。
+#
+# 这条流水线的用途不只是"别让 main 挂掉"。它还承担一个论文里的举证责任：
+# **把跨平台的能力差原样展示出来。**
+#
+# TrustGate 的非绕过性（SC5）在 Linux 上是内核强制的——Landlock 做路径粒度的
+# 文件系统白名单，seccomp-BPF 拒绝 AF_INET/AF_INET6 的 socket()，于是被剥权的
+# Agent 进程无论执行什么代码都读不到 sandbox/、写不了盘、连不上网。Windows 上
+# 没有等价机制：能做到的只有 Job Object 的生命周期与派生约束，文件与网络
+# **没有**内核兜底，因此 apply_confinement("S2") 会如实降级成 S1。
+#
+# 这不是"Windows 支持还没做完"，是平台能力差，项目选择如实记录而不是用措辞
+# 含糊过去（见 trustgate/confine.py 模块注释与 ConfinementReport.gaps）。
+# 具体表现：
+#   · ubuntu-latest 的内核带 Landlock，tests/test_confinement.py 里
+#     OsEnforcedConfinementTest 那几条**真的会执行**，断言内核确实拒绝了
+#     三条绕过路径（连"写盘没留下痕迹"都由父进程亲自查文件系统取证）；
+#   · windows-latest 上同一批用例走 self.skipTest() 主动跳过，跳过理由里
+#     写明这是已登记的能力缺口。
+#
+# 所以两个 runner 的日志放在一起看，就是 SC5 成立边界的直接证据。
+# 关键约束：**跳过不等于失败。** unittest 的退出码把 skipped 当成成功，
+# 下面任何一步都不要去"加强"这一点（比如 grep skipped 然后报错），那会变成
+# 要求一台没有 Landlock 的机器证明 Landlock 生效。
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  workflow_dispatch:
+
+# 同一分支的新 push 取消旧运行：矩阵有 6 格，排队会很快堆起来。
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: ${{ matrix.os }} · Python ${{ matrix.python-version }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      # 一格失败不影响其余格继续跑。这里尤其重要：我们需要同时看到
+      # Linux 与 Windows 的结果才能读出能力差，任一侧被提前取消就失去意义。
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        # 下限 3.11 由 pyproject.toml 的 requires-python 声明（`X | Y` 运行期
+        # 类型标注 + tomllib）。开发用的是 3.14，但矩阵刻意从声明的下限跑起，
+        # 否则那行 requires-python 就只是一句没人验证过的话。
+        python-version: ["3.11", "3.12", "3.13"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      # 刻意没有 pip install 这一步。零第三方依赖是设计决策（理由见
+      # pyproject.toml 的 dependencies 注释），因此 CI 里也不该出现任何
+      # 依赖安装——一旦出现，就说明有人偷偷加了依赖。
+      - name: 确认零运行时依赖
+        shell: bash
+        run: |
+          python - <<'PY'
+          import tomllib
+          with open("pyproject.toml", "rb") as fh:
+              proj = tomllib.load(fh)["project"]
+          deps = proj.get("dependencies") or []
+          extras = proj.get("optional-dependencies") or {}
+          assert not deps, f"引入了运行时依赖 {deps}：零依赖是刻意的设计决策，见 pyproject.toml"
+          assert not extras, f"引入了可选依赖 {extras}"
+          print("零依赖约束成立；requires-python =", proj["requires-python"])
+          PY
+
+      # 这一步是整条流水线里信息量最大的一格：它直接打出该 runner 能达到的
+      # 最高剥离档位。日志里看到 max_level=S2 就意味着后面那批内核级用例
+      # 真的跑了；看到 S1 就意味着它们按平台缺口跳过。没有这一步，"Windows
+      # 上跳了 N 条"会像是测试覆盖不全，而不是一条被测量出来的结论。
+      - name: 探测本机权限剥离能力（confine.probe）
+        # 全流水线统一 shell: bash（Windows runner 自带 Git Bash）。默认值在
+        # 两个 OS 上是不同的 shell（bash vs pwsh），引号与退出码传播规则都不
+        # 一样；矩阵的意义是比较**平台能力**，不该掺进 shell 行为差异。
+        shell: bash
+        env:
+          # Windows runner 的控制台代码页不是 UTF-8，而 probe 的调用方会打
+          # 中文说明。不设这两个变量，print 本身就会抛 UnicodeEncodeError，
+          # 表现为"某一步莫名失败但本地没事"。这个坑项目里踩过多次。
+          PYTHONUTF8: "1"
+          PYTHONIOENCODING: "utf-8"
+        run: |
+          python -c "import json; from trustgate.confine import probe; p=probe(); print(json.dumps(p, ensure_ascii=False, indent=2)); print('max_level=' + p['max_level'])"
+
+      - name: 单元测试（发现规则取自 pyproject.toml 的 [tool.unittest]）
+        shell: bash
+        env:
+          PYTHONUTF8: "1"
+          PYTHONIOENCODING: "utf-8"
+        run: python -m unittest discover -s tests -p "test_*.py" -t . -v
+
+      # 非绕过性的 S0 对照组在所有平台上都必须成立：三条绕过路径本来确实
+      # 走得通。这一格与平台无关——它证明的是"路径可达"，而不是"防御生效"。
+      # 只有它成立，S2 在 Linux 上的 0/3 才有参照。
+      - name: 非绕过性 S0 对照组（三条绕过路径必须全部可用）
+        shell: bash
+        env:
+          PYTHONUTF8: "1"
+          PYTHONIOENCODING: "utf-8"
+        run: |
+          python -m trustgate.sandbox build
+          python -c "import json,subprocess,sys; out=subprocess.run([sys.executable,'scripts/bypass_demo.py','--level','S0','--json'],capture_output=True,text=True,encoding='utf-8',check=True).stdout; n=json.loads(out)['bypass_count']; print('S0 bypass_count =', n); sys.exit(0 if n==3 else 'S0 对照组失效：无 S0 基线则 S2 的拦截结果失去参照')"
+
+      # 只在 Linux 上跑：这一格断言 S2 下三条绕过全部被内核拒绝。放到
+      # Windows 上必然失败（S2 会降级成 S1），而那个失败没有任何信息量——
+      # 它要测的机制在那个平台上根本不存在。
+      - name: 内核级权限剥离（S2 · 仅 Linux）
+        if: runner.os == 'Linux'
+        shell: bash
+        env:
+          PYTHONUTF8: "1"
+          PYTHONIOENCODING: "utf-8"
+        run: |
+          python -c "import json,subprocess,sys; out=subprocess.run([sys.executable,'scripts/bypass_demo.py','--level','S2','--json'],capture_output=True,text=True,encoding='utf-8',check=True).stdout; r=json.loads(out); print(json.dumps(r['confinement'], ensure_ascii=False, indent=2)); print('S2 bypass_count =', r['bypass_count']); sys.exit(0 if (r['bypass_count']==0 and r['confinement']['os_enforced']) else 'S2 未达成内核强制')"
+
+      # Windows 侧的对应断言：不要求它拦住，只要求它**别谎报**。降级时
+      # effective 必须不是 S2、os_enforced 必须为假、gaps 必须非空。
+      # 实验报告的可信度靠的就是这一条。
+      - name: 降级如实汇报（仅 Windows）
+        if: runner.os == 'Windows'
+        shell: bash
+        env:
+          PYTHONUTF8: "1"
+          PYTHONIOENCODING: "utf-8"
+        run: |
+          python -c "import json,subprocess,sys; out=subprocess.run([sys.executable,'scripts/bypass_demo.py','--level','S2','--json'],capture_output=True,text=True,encoding='utf-8',check=True).stdout; c=json.loads(out)['confinement']; print(json.dumps(c, ensure_ascii=False, indent=2)); sys.exit(0 if (c['requested']=='S2' and c['effective']!='S2' and not c['os_enforced'] and c['gaps']) else '降级时未如实登记缺口')"
+
+  # 完整复现流程只在一个格上跑：它本身就会把测试、样本生成、非绕过性、
+  # 篡改检测与主实验串一遍，六格全跑是纯粹的重复计算。选 Linux 是因为
+  # 只有那里 reproduce.py 的步骤 e 能走到内核强制那一档。
+  reproduce:
+    name: 一键复现（ubuntu · quick）
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: python scripts/reproduce.py --quick
+        shell: bash
+        env:
+          PYTHONUTF8: "1"
+          PYTHONIOENCODING: "utf-8"
+        run: python scripts/reproduce.py --quick
+      - name: 保留实验报告与审计日志
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: reproduce-logs
+          path: |
+            logs/*.json
+            logs/*.jsonl
+          if-no-files-found: warn

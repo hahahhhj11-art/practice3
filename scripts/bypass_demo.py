@@ -92,6 +92,22 @@ def main() -> int:
         icon = "绕过成功" if r["bypassed"] else "已被拦截"
         print(f"[{icon}] {name}\n           {r['detail']}")
     print(f"\n共 {payload['bypass_count']}/3 条绕过路径可用")
+
+    # B 号绕过在 S0/S1 下是**真的**往沙箱里写了一个文件。必须提醒清理，因为
+    # 残留文件会让后续的沙箱基线对不上，表现为下一轮实验里莫名多出一处"改动"。
+    #
+    # 刻意**不**在这里自动清理：tests/test_confinement.py 的
+    # test_write_attempt_leaves_no_trace_on_disk 靠"父进程亲自检查这个文件在不在"
+    # 来取证 Landlock 是否真的生效（Landlock 没有 /proc 内省，只能这样查）。
+    # 脚本若自己删掉痕迹，那条测试在 Landlock 静默失效时也会通过——把唯一的
+    # 证据擦掉，换来一点便利，不值得。清理交给调用方（reproduce.py 步骤 e 之后、
+    # 测试的 tearDown）在父侧做。
+    if results["B_write_filesystem"]["bypassed"]:
+        print(
+            f"\n提示：本次真的在沙箱里写下了 {scratch.relative_to(ROOT)}。\n"
+            "      残留会让后续实验的基线比对多出一处'改动'，请执行：\n"
+            "          python -m trustgate.sandbox reset"
+        )
     return 0
 
 

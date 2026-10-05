@@ -1,0 +1,74 @@
+# TrustGate 的项目元数据。
+#
+# 这个文件存在的理由只有一个：让审稿人能把"用什么解释器、装什么依赖"这件事
+# 从复现步骤里彻底去掉。它**不是**为了把 TrustGate 发布到 PyPI——实验装置
+# （eval/、attacks/、scripts/、tests/）刻意不打包，它们只在仓库内以
+# `python -m` 的形式运行，见下面 [tool.setuptools] 的说明。
+
+[build-system]
+# setuptools 是 CPython 生态里唯一"装 Python 就基本已经在手边"的后端。
+# 换成 poetry/hatch 会在复现链条最前面凭空插入一次网络安装——而复现性
+# 恰恰是本项目选择零依赖的初衷，不该在构建后端上把它还回去。
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "trustgate"
+version = "0.2.0"
+description = "面向终端 AI Agent 的间接提示注入（IPI）防御网关：任务-能力绑定 + 污点传播 + 内核级权限剥离"
+readme = "README.md"
+
+# 为什么是 3.11 而不是更低
+# ------------------------
+# 代码里有两处硬性语法/API 下限，降版本会直接 SyntaxError 或 TypeError：
+#   · `X | Y` 形式的类型标注写在运行期求值的位置（dataclass 字段、
+#     ctypes 结构体旁的函数签名），3.9 及以下不接受；
+#   · `Path.unlink(missing_ok=True)`（3.8+）与 `Path.is_relative_to`（3.9+）
+#     被 eval/run_eval.py 与 run_trial 的清理路径直接依赖；
+#   · tomllib（3.11+）被 scripts/reproduce.py 用来读本文件的
+#     [tool.unittest] 配置——这是零依赖前提下唯一的 TOML 解析器。
+# 实际开发与论文数据采集用的是 Python 3.14.6；CI 覆盖 3.11/3.12/3.13，
+# 目的是证明下限声明不是随口写的。
+requires-python = ">=3.11"
+
+# 零运行时依赖，这是**刻意的设计决策，不是还没来得及加**。
+#
+# 三个理由，按重要性排序：
+#   1. 复现性。审稿人 clone 之后只需要一个 CPython 解释器，不需要 pip、
+#      不需要网络、不需要 lock 文件，也就不存在"半年后某个传递依赖发版把
+#      结果改了"这类问题。安全会议的 artifact evaluation 尤其吃这一点。
+#   2. TCB 面积。可信锚与 PDP 属于 TCB；每引入一个第三方包，就等于把
+#      那个包的全部代码纳入 TCB，而威胁模型 §3 里对手 A2 有本机任意
+#      用户态文件读写能力——site-packages 正在其射程内。
+#   3. 内核接口只能直呼。Landlock 与 seccomp-BPF 是靠 ctypes 直接发
+#      syscall 实现的（trustgate/confine.py）。市面上的封装库反而会挡住
+#      "哪一位 ABI 不被本机内核支持"这类必须如实汇报的细节。
+#
+# 因此这个列表必须保持为空。需要新能力时先问"标准库能不能做"，
+# 不能做再讨论是否值得动这条约束。
+dependencies = []
+
+[project.optional-dependencies]
+# 接真实模型（--llm openai）走的是 urllib + OpenAI 兼容 HTTP 接口，
+# 同样不需要 openai SDK，所以这里也没有 extras。刻意留空以示区别于
+# "忘了写"：真的没有任何可选依赖。
+
+[tool.setuptools]
+# 只有 trustgate/ 是库。eval/、attacks/、scripts/、tests/ 是实验装置：
+# 它们假定 CWD 是仓库根（用 parents[1] 定位 ROOT、读 policy.json、写
+# logs/），装到 site-packages 里反而会跑不起来。另外顶层包名叫 `eval`
+# 会和内建函数同名，装出去是给别人添乱。
+packages = ["trustgate"]
+
+[tool.unittest]
+# 标准库 unittest 不读 pyproject.toml，所以这一节不会被它自动识别。
+# 它在这里是**真配置**而非摆设：scripts/reproduce.py 用 tomllib 读走
+# 这三个键再拼出 `python -m unittest discover` 的参数，CI 里也照抄同一组
+# 取值。这样"测试怎么被发现"只有一个事实来源，不会出现复现脚本、CI、
+# README 三处各写一套发现规则然后悄悄跑偏。
+start-dir = "tests"
+pattern = "test_*.py"
+# 顶层目录必须是仓库根：测试与被测代码都按 `from trustgate import ...`
+# 导入，若让 unittest 把 tests/ 当顶层，sys.path 里就没有仓库根了。
+top-level-dir = "."
+verbosity = 2

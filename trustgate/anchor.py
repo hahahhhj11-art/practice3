@@ -151,6 +151,9 @@ class AnchorCore:
             "policy_hash": self.policy.source_digest,
             "policy_version": self.policy.version,
             "tainted_paths": self.tainted_paths(),
+            # 取证捕获开关。也必须从锚取而不是让 Broker 自己读盘——否则对手 A2
+            # 改一个字段就能把取证材料悄悄关掉，而 attest() 毫无察觉。
+            "forensics": self.policy.sec("forensics"),
         }
 
     # ---------- 会话生命周期 ----------
