@@ -10,3 +10,10 @@ sandbox/
 # 只跟踪生成器本身，避免仓库被上千个小文件淹没。
 attacks/corpus/
 attacks/samples/
+
+# TEE 构建产物：由 tee/Makefile 现场编译，不进版本库
+tee/bridge/tg_bridge
+tee/bridge/tg_bridge_soft
+tee/ta/*.o
+tee/ta/*.d
+tee/ta/*.ta

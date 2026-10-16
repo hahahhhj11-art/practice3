@@ -102,6 +102,9 @@ def main() -> int:
             audit=args.audit,
             confirm=args.confirm,
             key_source=args.key_source,
+            # 本脚本是最小的端到端演示（S0 实验者拓扑）：校验密钥由实验者
+            # 当场取走校验，故显式开启导出。正式拓扑（Supervisor）不走这条通道。
+            allow_key_export=True,
         )
         # 密钥必须在 Broker 还活着的时候取走：ephemeral 模式下进程一退出，
         # 这把密钥就再也拿不回来了，事后就无法校验这段日志。
