@@ -153,6 +153,10 @@ class Broker:
                 "audit_head": self.audit.head,
                 "checkpoint": self.anchor.chain_checkpoint(),
             }
+        if kind == "checkpoint":
+            # 只读探针：不追加任何审计记录。校验方用它向（可能重启过的）锚
+            # 询问当前链权威状态，以反驳陈旧检查点（scripts/replay_demo.py）。
+            return {"type": "checkpoint", "checkpoint": self.anchor.chain_checkpoint()}
         if kind == "export_key":
             if not self.expose_key:
                 return {"type": "error", "error": "本通道不提供审计密钥导出（仅特权侧可取）"}
@@ -477,6 +481,13 @@ class BrokerChannel:
         except Exception:
             return {}
 
+    def probe_checkpoint(self) -> dict[str, Any]:
+        """只读探针：询问锚当前的链权威状态（不追加审计记录）。"""
+        try:
+            return dict(self._send({"type": "checkpoint"}).get("checkpoint", {}))
+        except Exception:
+            return {}
+
     def export_key(self) -> str:
         """取回审计验证密钥。
 
@@ -571,7 +582,7 @@ if __name__ == "__main__":
     ap.add_argument("--policy", default="policy.json")
     ap.add_argument("--audit", default="logs/audit.jsonl")
     ap.add_argument("--confirm", default="tty", choices=["tty", "deny", "allow"])
-    ap.add_argument("--key-source", default="file", choices=["file", "ephemeral", "env"])
+    ap.add_argument("--key-source", default="file", choices=["file", "ephemeral", "env", "tee"])
     ap.add_argument(
         "--expose-key",
         action="store_true",

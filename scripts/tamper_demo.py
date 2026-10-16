@@ -84,8 +84,12 @@ def produce_log(audit_rel: str, key_source: str) -> tuple[Path, dict[str, Any], 
 
     build(force=True)
     httpd, _ = serve_in_background(port=8799, log_path=ROOT / "logs" / "tamper-collector.jsonl")
+    # allow_key_export=True 是本演示（S0 实验者拓扑）的有意选择：校验方就是
+    # 实验者本人，需在会话期间经通道取走 ephemeral 密钥。正式 S1/S2 拓扑下
+    # 该开关保持关闭（见 trustgate/broker.py 的说明）。
     broker = BrokerClient(anchor="T1", policy="policy.json", audit=audit_rel,
-                          confirm="deny", key_source=key_source)
+                          confirm="deny", key_source=key_source,
+                          allow_key_export=True)
     try:
         # 密钥必须在 Broker 还活着的时候取走：ephemeral 模式下进程一退出
         # 就再也拿不回来，事后无法校验这段日志。这正是 T1 相对 T2 的缺口。

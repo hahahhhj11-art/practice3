@@ -4,7 +4,9 @@
 
   T0 InProcessAnchor      同进程，仅用于测功能与延迟下界，不抵抗任何本地对手
   T1 IsolatedProcessAnchor 独立进程 + 单向 stdio 通道，密钥不出该进程
-  T2 OpteeAnchor          QEMU + OP-TEE TA（选做，接口已预留）
+  T2 TeeAnchorCore        QEMU + OP-TEE TA：链权威（密钥/序号/链头）在 RPMB
+                          安全存储内，serve 侧子类；客户端形态与 T1 相同
+                          （docs/06-T2可信锚实现方案.md）
 
 TCB 最小化原则（P4）：锚内只有策略求值 + 会话状态 + HMAC 密钥。
 不含 LLM、不含网络栈、不含文件系统工具——TCB 越小越可信。
@@ -16,6 +18,7 @@ TCB 最小化原则（P4）：锚内只有策略求值 + 会话状态 + HMAC 密
 from __future__ import annotations
 
 import argparse
+import base64
 import hashlib
 import hmac
 import json
@@ -26,7 +29,7 @@ import sys
 from pathlib import Path
 from typing import Any, Protocol
 
-from .audit import GENESIS, chain_record
+from .audit import GENESIS, canonical_payload, chain_record
 from .paths import project_root
 from .policy import Policy, PolicyEngine, SessionState
 from .taint import find_canaries
@@ -59,17 +62,19 @@ def _load_key(source: str) -> tuple[bytes, str]:
             raise RuntimeError("key_source=env 但环境变量 TG_ANCHOR_KEY 为空（fail-closed）")
         return hashlib.sha256(raw.encode()).digest(), "env"
 
-    p = project_root() / KEY_PATH
-    p.parent.mkdir(parents=True, exist_ok=True)
-    if p.exists():
-        return p.read_bytes(), "file"
-    key = os.urandom(32)
-    p.write_bytes(key)
-    try:
-        p.chmod(stat.S_IRUSR | stat.S_IWUSR)
-    except OSError:
-        pass
-    return key, "file"
+    if source == "file":
+        p = project_root() / KEY_PATH
+        p.parent.mkdir(parents=True, exist_ok=True)
+        if p.exists():
+            return p.read_bytes(), "file"
+        key = os.urandom(32)
+        p.write_bytes(key)
+        try:
+            p.chmod(stat.S_IRUSR | stat.S_IWUSR)
+        except OSError:
+            pass
+        return key, "file"
+    raise ValueError(f"未知密钥来源 {source!r}（fail-closed；'tee' 由 TeeAnchorCore 处理，不经本函数）")
 
 
 class TrustedAnchor(Protocol):
@@ -91,11 +96,16 @@ class AnchorCore:
     """锚的全部业务逻辑。T0 直接调用它，T1 在子进程里跑它。"""
 
     def __init__(self, policy_path: str = "policy.json", key_source: str = "file"):
+        self._load_core_state(policy_path)
+        self._key, self.key_source = _load_key(key_source)
+
+    def _load_core_state(self, policy_path: str) -> None:
+        """策略与会话状态的装载。T2 子类复用本方法，但不取本地密钥。"""
         self.policy = Policy.load(policy_path)
         self.engine = PolicyEngine(self.policy)
-        self._key, self.key_source = _load_key(key_source)
         self.sessions: dict[str, SessionState] = {}
         # 审计链的权威状态。留在锚内，Broker 与日志文件都无权推进它。
+        # T2 下这两个字段不被使用：权威状态在 TA 内（见 TeeAnchorCore）。
         self._chain_seq = 0
         self._chain_head = GENESIS
         self._provenance: set[str] = self._load_provenance()
@@ -360,6 +370,9 @@ class IsolatedProcessAnchor:
 
     def __init__(self, policy_path: str = "policy.json", key_source: str = "ephemeral"):
         self._policy_path = policy_path
+        # kind 是实例属性而非类属性：T2 复用本类的客户端形态（独立进程 +
+        # JSONL stdio），serve 侧换用 TeeAnchorCore，attest 必须如实汇报档位。
+        self.kind = "T2" if key_source == "tee" else "T1"
         child_env = os.environ.copy()
         child_env["PYTHONUTF8"] = "1"
         self.proc = subprocess.Popen(
@@ -433,12 +446,128 @@ class IsolatedProcessAnchor:
             self.proc.kill()
 
 
+# ---------- T2：TEE 桥接与 serve 侧子类 ----------
+
+BRIDGE_BIN_ENV = "TG_TEE_BRIDGE"
+
+
+class TeeBridge:
+    """TEE 桥接子进程（tg_bridge）的 JSONL 客户端。
+
+    tg_bridge 在真机下经 libteec 连接 OP-TEE 里的 trustgate_ta；开发机上的
+    tg_bridge_soft 是软模拟（不链 libteec，状态落普通文件），**仅供开发与
+    单元测试**，绝不允许出现在实验数据路径里（docs/06-T2可信锚实现方案.md
+    §3 的诚实边界）。
+
+    二进制定位顺序：显式 cmd > 环境变量 TG_TEE_BRIDGE > 仓库默认路径。
+    桥或 TA 任何一步失败都抛 RuntimeError，由锚按 P5 fail-closed。
+    """
+
+    def __init__(self, cmd: str | os.PathLike[str] | None = None):
+        path = Path(cmd or os.environ.get(BRIDGE_BIN_ENV) or project_root() / "tee" / "bridge" / "tg_bridge")
+        if not path.exists():
+            raise RuntimeError(
+                f"未找到 TEE 桥接程序 {path}。开发机请先 `make -C tee soft` 编译软模拟版；"
+                "真机（QEMU guest）构建见 tee/README.md。"
+            )
+        self.proc = subprocess.Popen(
+            [str(path)],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=None,
+            text=True,
+            encoding="utf-8",
+            bufsize=1,
+        )
+        try:
+            self.rpc("init")  # 建立 TA 会话并加载状态；失败即抛错（fail-closed）
+        except Exception:
+            self.close()
+            raise
+
+    def rpc(self, op: str, **kwargs: Any) -> dict[str, Any]:
+        assert self.proc.stdin and self.proc.stdout
+        try:
+            self.proc.stdin.write(json.dumps({"op": op, **kwargs}, ensure_ascii=False) + "\n")
+            self.proc.stdin.flush()
+            line = self.proc.stdout.readline()
+        except (BrokenPipeError, OSError) as exc:
+            raise RuntimeError(f"TEE 桥接进程已退出（fail-closed：调用方应拒绝本次操作）: {exc}")
+        if not line:
+            raise RuntimeError("TEE 桥接进程已退出（fail-closed：调用方应拒绝本次操作）")
+        resp = json.loads(line)
+        if "error" in resp:
+            raise RuntimeError(f"TEE 桥/TA 错误: {resp['error']}")
+        return dict(resp.get("result") or {})
+
+    def close(self) -> None:
+        if getattr(self, "_closed", False):
+            return
+        self._closed = True
+        try:
+            if self.proc.stdin:
+                self.proc.stdin.close()
+            if self.proc.stdout:
+                self.proc.stdout.close()
+            self.proc.wait(timeout=3)
+        except Exception:
+            self.proc.kill()
+
+
+class TeeAnchorCore(AnchorCore):
+    """T2 的 serve 侧：链权威（密钥 + 单调序号 + 链头）整体在 OP-TEE TA 内，
+    存于 RPMB 安全存储——重启不丢、旧状态不可整块回滚
+    （docs/06-T2可信锚实现方案.md §3，决策 D1/D3）。
+
+    业务逻辑（策略求值、会话状态、溯源存储）全部继承自 AnchorCore；被替换的
+    只有链相关的五个方法，它们把请求转发给 tg_bridge，由 TA 完成签名与序号
+    推进。链推进在 TA 内原子完成：读 {seq, head} → 算 hash → HMAC →
+    seq+1 写回 RPMB，一步不落（决策：每条立刻写盘，论断不留时间窗）。
+
+    哈希公式与 T0/T1 完全一致（trustgate/audit.py chain_record）：host 侧先
+    算出 canonical payload 的原文，TA 不解析 JSON，只做 sha256 拼接——
+    序列化规则全项目只有 Python 一个权威。
+    """
+
+    def __init__(self, policy_path: str = "policy.json", bridge: TeeBridge | None = None):
+        self._load_core_state(policy_path)
+        # 刻意不调用 _load_key：密钥由 TA 保管，host 侧任何时刻都不持有。
+        self.key_source = "tee"
+        self._bridge = bridge or TeeBridge()
+
+    def chain_append(self, payload: dict[str, Any]) -> dict[str, Any]:
+        cp = canonical_payload(payload)
+        res = self._bridge.rpc("chain_append", payload_b64=base64.b64encode(cp).decode("ascii"))
+        return {
+            "seq": int(res["seq"]),
+            "prev_hash": str(res["prev_hash"]),
+            "hash": str(res["hash"]),
+            "mac": str(res["mac"]),
+        }
+
+    def chain_checkpoint(self) -> dict[str, Any]:
+        res = self._bridge.rpc("checkpoint")
+        return {"seq": int(res["seq"]), "head": str(res["head"]), "mac": str(res["mac"])}
+
+    def export_key(self) -> str:
+        """T2 的密钥跨重启持久（RPMB），校验方仍经可信通道取走一次。"""
+        return str(self._bridge.rpc("export_key").get("key", ""))
+
+    def seal(self, data: bytes) -> str:
+        res = self._bridge.rpc("seal", data_b64=base64.b64encode(data).decode("ascii"))
+        return str(res.get("mac", ""))
+
+    def close(self) -> None:
+        self._bridge.close()
+
+
 def make_anchor(kind: str = "T1", policy_path: str = "policy.json", key_source: str | None = None) -> Any:
     """按档位构造可信锚。
 
     默认密钥来源随档位而变，且是刻意的：T0 是功能与延迟基线档，不宣称
     抵抗任何本地对手，用落盘密钥换取演示便利；T1 一旦宣称抵抗 A2-C1，
-    密钥就不能待在 A2 读得到的地方，只能是 ephemeral。
+    密钥就不能待在 A2 读得到的地方，只能是 ephemeral；T2 的密钥在 TEE
+    安全存储里，host 侧只有 "tee" 这个转发开关。
     """
     kind = kind.upper()
     if kind == "T0":
@@ -446,14 +575,20 @@ def make_anchor(kind: str = "T1", policy_path: str = "policy.json", key_source: 
     if kind == "T1":
         return IsolatedProcessAnchor(policy_path, key_source or "ephemeral")
     if kind == "T2":
-        raise NotImplementedError("T2 (QEMU + OP-TEE) 为第 12 周选做项，接口已在 §5.2 冻结")
+        # 客户端形态与 T1 完全相同（独立锚进程 + JSONL stdio）；serve 侧由
+        # _serve 按 key_source=="tee" 换用 TeeAnchorCore（docs/06 §3）。
+        return IsolatedProcessAnchor(policy_path, key_source or "tee")
     raise ValueError(f"未知的可信锚档位: {kind}")
 
 
-# ---------- T1 的服务端（子进程入口） ----------
+# ---------- T1/T2 的服务端（子进程入口） ----------
 
 def _serve(policy_path: str, key_source: str) -> None:
-    core = AnchorCore(policy_path, key_source)
+    core: AnchorCore
+    if key_source == "tee":
+        core = TeeAnchorCore(policy_path)
+    else:
+        core = AnchorCore(policy_path, key_source)
     ops = {
         "session_start": lambda a: core.session_start(a["session_id"], a["task"]),
         "observe": lambda a: core.observe(a["session_id"], a["text"], a["trust"], a.get("source", "")),
@@ -468,28 +603,34 @@ def _serve(policy_path: str, key_source: str) -> None:
         "seal": lambda a: core.seal(a["data"].encode("utf-8", "surrogateescape")),
         "attest": lambda a: core.attest(),
     }
-    for line in sys.stdin:
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            req = json.loads(line)
-            fn = ops.get(req.get("op", ""))
-            if fn is None:
-                out = {"error": f"未知操作 {req.get('op')}"}
-            else:
-                out = {"result": fn(req)}
-        except Exception as exc:  # 锚内异常一律回报错误，由调用方 fail-closed
-            out = {"error": f"{type(exc).__name__}: {exc}"}
-        sys.stdout.write(json.dumps(out, ensure_ascii=False) + "\n")
-        sys.stdout.flush()
+    try:
+        for line in sys.stdin:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                req = json.loads(line)
+                fn = ops.get(req.get("op", ""))
+                if fn is None:
+                    out = {"error": f"未知操作 {req.get('op')}"}
+                else:
+                    out = {"result": fn(req)}
+            except Exception as exc:  # 锚内异常一律回报错误，由调用方 fail-closed
+                out = {"error": f"{type(exc).__name__}: {exc}"}
+            sys.stdout.write(json.dumps(out, ensure_ascii=False) + "\n")
+            sys.stdout.flush()
+    finally:
+        # TeeAnchorCore 持有桥子进程；T0/T1 的 AnchorCore 没有 close，跳过即可。
+        close = getattr(core, "close", None)
+        if callable(close):
+            close()
 
 
 if __name__ == "__main__":
-    ap = argparse.ArgumentParser(description="TrustGate 可信锚（T1 隔离进程模式）")
+    ap = argparse.ArgumentParser(description="TrustGate 可信锚（T1 隔离进程 / T2 TEE 模式）")
     ap.add_argument("--serve", action="store_true")
     ap.add_argument("--policy", default="policy.json")
-    ap.add_argument("--key-source", default="file", choices=["file", "ephemeral", "env"])
+    ap.add_argument("--key-source", default="file", choices=["file", "ephemeral", "env", "tee"])
     ns = ap.parse_args()
     if ns.serve:
         _serve(ns.policy, ns.key_source)

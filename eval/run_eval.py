@@ -92,6 +92,10 @@ GROUPS: dict[str, Group] = {
                 _layers("L1_static", "L2_manifest", "L3_taint", "L4_temporal", spotlight=True)),
     "C5": Group("C5", "完整防御 + 可信锚 T1", "enforce", _layers(*ALL_LAYERS, spotlight=True),
                 anchor="T1", note="含风险计分与确认；PDP、密钥、链头在隔离进程内"),
+    # T2 组不在默认列表：必须在 QEMU guest（真桥 + RPMB TA）内运行，见 tee/README.md。
+    "C5T2": Group("C5T2", "完整防御 + 可信锚 T2 (QEMU+OP-TEE)", "enforce",
+                  _layers(*ALL_LAYERS, spotlight=True),
+                  anchor="T2", note="链权威（密钥/序号/链头）在 RPMB 安全存储内"),
 }
 
 
@@ -426,7 +430,7 @@ def verify_persistence(
         policy=str(policy_path),
         audit=str(audit.relative_to(project_root())),
         confirm=confirm,
-        key_source="file" if group.anchor == "T0" else "ephemeral",
+        key_source={"T0": "file", "T1": "ephemeral", "T2": "tee"}[group.anchor],
     )
     rule = ""
     injected_tools = [str(a.get("tool", "")) for a in spec.get("actions", [])]
@@ -502,7 +506,7 @@ def run_trial(
         policy=str(policy_path),
         audit=str(audit.relative_to(project_root())),
         confirm=confirm,
-        key_source="file" if group.anchor == "T0" else "ephemeral",
+        key_source={"T0": "file", "T1": "ephemeral", "T2": "tee"}[group.anchor],
     )
     trial = Trial(
         group=group.gid,
@@ -784,7 +788,8 @@ def load_samples(
 
 def main() -> int:
     ap = argparse.ArgumentParser(description="TrustGate C0–C5 对比实验")
-    ap.add_argument("--groups", default=",".join(GROUPS), help="逗号分隔，默认全部")
+    ap.add_argument("--groups", default=",".join(k for k in GROUPS if k != "C5T2"),
+                    help="逗号分隔，默认全部（C5T2 需 TEE 桥，不在默认内）")
     ap.add_argument("--limit", type=int, help="每组只跑前 N 条攻击样本（按类别轮转取样）")
     ap.add_argument("--targets", help="只跑指定攻击类别，如 exfil,persist")
     ap.add_argument("--evasions", help="只跑指定规避层级，如 policy_aware,path_lowbw")
