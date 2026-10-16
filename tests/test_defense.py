@@ -19,6 +19,7 @@ import shutil
 import sys
 import tempfile
 import unittest
+import urllib.request
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -65,6 +66,42 @@ def _cleanup_tempdirs() -> None:
         if d.is_relative_to(_TEMP_ROOT) and d.name.startswith("tg-policy-"):
             shutil.rmtree(d, ignore_errors=True)
     _created_tempdirs.clear()
+
+
+class ServerRebindTest(unittest.TestCase):
+    """同一端口在 60 秒 TIME_WAIT 窗口内重启服务器，必须能绑得上（非 Windows）。
+
+    serve_corpus 的地址复用按平台分流：Linux/macOS 开（只消化 TIME_WAIT 尸体
+    端口，活监听仍独占），Windows 关（SO_REUSEADDR 在 Windows 允许两个活服务
+    器抢同一端口，外泄判定预言机有被偷流量的风险）。一键复现（reproduce.py）
+    在同一进程里先全量跑测试、再单跑取证测试，同端口 60 秒内复用两次——
+    这就是当初 CI 复现任务红掉的格子，用这条测试锁住。
+    """
+
+    PORT = 8823  # 独占端口，避开本模块 8811/8799 上常驻的样本服务器
+
+    def test_rebind_within_time_wait_window(self) -> None:
+        if sys.platform == "win32":
+            self.skipTest(
+                "Windows 刻意禁止地址复用：SO_REUSEADDR 在那里允许两个活服务器"
+                "抢同一端口（判定预言机被偷流量），快速重绑必然失败，是设计而非缺陷"
+            )
+        for cycle in range(2):
+            httpd, _ = serve_in_background(
+                port=self.PORT, log_path=ROOT / "logs" / "test-rebind.jsonl"
+            )
+            try:
+                # 发一次请求让服务器侧产生一条连接；_Handler 走 HTTP/1.0，
+                # 服务器先断开 → 该连接在服务器侧进 TIME_WAIT，占住端口。
+                # 404 也算数——只需要 TCP 连接真实存在过。
+                try:
+                    urllib.request.urlopen(f"http://127.0.0.1:{self.PORT}/", timeout=2)
+                except Exception:
+                    pass
+            finally:
+                httpd.shutdown()
+                httpd.server_close()
+            # 第二轮绑定若失败，说明有人把分平台的 allow_reuse_address 改坏了
 
 
 class DefenseTest(unittest.TestCase):

@@ -153,7 +153,7 @@ class _Handler(BaseHTTPRequestHandler):
 
 
 def _assert_port_free(host: str, port: int) -> None:
-    """端口已被占用时必须大声失败，绝不静默共用。
+    """端口被**活的**进程占用时必须大声失败，绝不静默共用。
 
     这条护栏是被一次难查的假结果逼出来的：socketserver 默认置
     ``allow_reuse_address = 1``，而 **Windows 上的 SO_REUSEADDR 允许重复绑定
@@ -163,7 +163,8 @@ def _assert_port_free(host: str, port: int) -> None:
     是空的，于是**所有外泄类攻击都被判为失败**，ASR 被系统性低估、防御成绩
     虚高；而且同一套代码两次运行会给出不同的失败格子，看起来像随机波动。
 
-    宁可让实验起不来，也不能让它带着错误的判定预言机跑完。
+    探测 connect_ex 只认"活着的监听者"：它挡住共用端口的真危险，
+    不挡下面 make_server 里非 Windows 平台刻意放行的 TIME_WAIT 尸体。
     """
     import socket
 
@@ -184,9 +185,17 @@ def make_server(host: str = "127.0.0.1", port: int = 8799,
     _assert_port_free(host, port)
     collector = Collector(log_path)
     handler = type("BoundHandler", (_Handler,), {"collector": collector, "quiet": quiet})
-    # 在 Windows 上显式关掉地址复用：即便上面的探测因竞态漏过，bind 也会以
-    # WinError 10048 失败，而不是悄悄与旧 server 共用端口。
-    server_cls = type("GuardedServer", (ThreadingHTTPServer,), {"allow_reuse_address": False})
+    # 地址复用按平台分流（这个坑 CI 与一键复现都踩过）：
+    #   · Windows 必须关——SO_REUSEADDR 在 Windows 允许两个活服务器抢同一
+    #     addr:port（上面的 connect 探测是主防线，这是兜底），共用端口的
+    #     后果是外泄判定预言机被偷流量、ASR 系统性失真；
+    #   · Linux/macOS 必须开——那边的 SO_REUSEADDR 只消化 TIME_WAIT 尸体
+    #     端口（服务器侧先断开的连接残留约 60 秒），不影响"一个活监听"的
+    #     独占性（重复绑定活端口仍报 EADDRINUSE）。关了它，同一进程 60 秒内
+    #     重启服务器（reproduce.py 全量测试后再单跑取证测试）必然撞墙。
+    allow_reuse = sys.platform != "win32"
+    server_cls = type("GuardedServer", (ThreadingHTTPServer,),
+                      {"allow_reuse_address": allow_reuse})
     httpd = server_cls((host, port), handler)
     return httpd, collector
 
