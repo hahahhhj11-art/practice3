@@ -113,6 +113,20 @@ python3 -m eval.run_eval --groups C5T2 --limit 20  # 端到端攻击样本
 
 踩坑记录（RPMB 具体开关、rootfs 改动等）请追加到本文档，下次复现不再重缴学费。
 
+## Windows 主机复测（去 CI 盲点）
+
+WSL 里开发时想提前验证 Windows 行为，在 **Windows 侧**（Git Bash 或 cmd）执行：
+
+```bash
+gcc -O2 -Wall -Wextra -DSOFT_TA -o tee/bridge/tg_bridge_soft.exe tee/bridge/tg_bridge.c
+set TG_TEE_BRIDGE=%CD%\tee\bridge\tg_bridge_soft.exe   # cmd；bash 用 export
+python -m unittest tests.test_tee_anchor -v
+```
+
+MinGW gcc（Git for Windows / Strawberry Perl 均自带）产物是 `.exe`；
+测试的 `_soft_bin()` 两种后缀都认。跨 WSL 边界的 `\wsl.localhost` UNC
+路径不能让 ld 直接写输出，先编到 Windows 临时目录再拷回。
+
 ## 协议（锚进程 ⇄ 桥）
 
 stdio 上 JSON Lines，与 `trustgate/anchor.py::TeeBridge` 对应：

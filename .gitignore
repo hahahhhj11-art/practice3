@@ -14,6 +14,7 @@ attacks/samples/
 # TEE 构建产物：由 tee/Makefile 现场编译，不进版本库
 tee/bridge/tg_bridge
 tee/bridge/tg_bridge_soft
+tee/bridge/tg_bridge_soft.exe
 tee/ta/*.o
 tee/ta/*.d
 tee/ta/*.ta

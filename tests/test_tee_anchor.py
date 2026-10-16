@@ -38,8 +38,18 @@ _tmpdir: Path | None = None
 _state_file: Path | None = None
 
 
+def _soft_bin() -> Path:
+    """软模拟桥的实际路径。MinGW gcc 编译 -o tg_bridge_soft 会产出
+    tg_bridge_soft.exe（Windows runner 自带 gcc，CI 上踩过），探测时
+    两种后缀都要认。"""
+    for cand in (SOFT_BIN, SOFT_BIN.with_suffix(".exe")):
+        if cand.exists():
+            return cand
+    return SOFT_BIN
+
+
 def _build_soft_bridge() -> None:
-    if SOFT_BIN.exists():
+    if _soft_bin().exists():
         return
     if shutil.which("gcc") is None:
         raise unittest.SkipTest("无 gcc，无法编译软模拟桥")
@@ -60,7 +70,7 @@ def setUpModule() -> None:
     _state_file = _tmpdir / "soft-state.json"
     for k in (_BRIDGE_ENV, _STATE_ENV):
         _old_env[k] = os.environ.get(k)
-    os.environ[_BRIDGE_ENV] = str(SOFT_BIN)
+    os.environ[_BRIDGE_ENV] = str(_soft_bin())
     os.environ[_STATE_ENV] = str(_state_file)
 
 

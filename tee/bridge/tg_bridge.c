@@ -29,6 +29,7 @@
 
 #ifdef SOFT_TA
 #include <fcntl.h>
+#include <time.h>
 #include <unistd.h>
 #else
 #include <tee_client_api.h>
@@ -388,6 +389,20 @@ static void chain_digest_mac(const tg_state *st, const uint8_t *payload, size_t 
 static char g_state_path[192];
 
 static int soft_random(uint8_t *out, size_t len) {
+#ifdef _WIN32
+    /* /dev/urandom 是 Linux 专有，Windows 上不存在。软模拟仅供开发测试、
+       不产生任何安全性质（tee/README.md 的诚实边界），退化为
+       时间 + PID + 栈地址播种的 LCG 足以让各测试会话密钥互不相同。
+       真桥的随机数由 TA 内 TEE_GenerateRandom 提供，不走这条路。 */
+    static unsigned seed;
+    size_t i;
+    seed = (unsigned)time(NULL) ^ (unsigned)(uintptr_t)&seed ^ (unsigned)getpid();
+    for (i = 0; i < len; i++) {
+        seed = seed * 1103515245u + 12345u;
+        out[i] = (uint8_t)(seed >> 16);
+    }
+    return 0;
+#else
     int fd = open("/dev/urandom", O_RDONLY);
     ssize_t r;
     if (fd < 0)
@@ -395,6 +410,7 @@ static int soft_random(uint8_t *out, size_t len) {
     r = read(fd, out, len);
     close(fd);
     return r == (ssize_t)len ? 0 : -1;
+#endif
 }
 
 static int state_init(tg_state *st, char *err, size_t errsz) {
@@ -412,7 +428,7 @@ static int state_init(tg_state *st, char *err, size_t errsz) {
         /* 首次启动：生成密钥，从创世状态开始。 */
         state_genesis(st);
         if (soft_random(st->key, TG_STATE_KEY_LEN) != 0) {
-            snprintf(err, errsz, "无法从 /dev/urandom 生成密钥");
+            snprintf(err, errsz, "无法生成初始密钥");
             return -1;
         }
         return state_save(st, err, errsz);
@@ -455,6 +471,12 @@ static int state_save(const tg_state *st, char *err, size_t errsz) {
         snprintf(err, errsz, "无法写入状态文件 %s", tmp);
         return -1;
     }
+#ifdef _WIN32
+    /* MSVCRT 的 rename() 不会替换已存在的目标（与 POSIX 的原子替换不同），
+       先删除再改名。这不是原子操作——但软模拟仅供开发测试，无需崩溃一致性
+       保证（真桥的状态写在 TA/RPMB 里，根本不经过这条路径）。 */
+    remove(g_state_path);
+#endif
     if (rename(tmp, g_state_path) != 0) {
         snprintf(err, errsz, "无法替换状态文件 %s", g_state_path);
         return -1;
@@ -643,6 +665,10 @@ int main(void) {
             fflush(stdout);
             continue;
         }
+        /* Windows 文本管道送 \r\n，剥掉行尾 \r 再解析。 */
+        g_line[strcspn(g_line, "\r\n")] = 0;
+        if (!g_line[0])
+            continue;
 
         if (json_get_str(g_line, "op", op, sizeof(op)) != 0) {
             printf("{\"error\":\"缺少 op 字段\"}\n");
