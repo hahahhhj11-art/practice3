@@ -62,6 +62,12 @@ jobs:
       # 依赖安装——一旦出现，就说明有人偷偷加了依赖。
       - name: 确认零运行时依赖
         shell: bash
+        env:
+          # 与其他 print 中文的步骤同理（见 confine.probe 一节的注释）：
+          # Windows runner 默认 cp1252，不设这两个变量，print 直接抛
+          # UnicodeEncodeError，这一步会"莫名"失败。
+          PYTHONUTF8: "1"
+          PYTHONIOENCODING: "utf-8"
         run: |
           python - <<'PY'
           import tomllib
