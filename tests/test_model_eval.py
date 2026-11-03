@@ -72,6 +72,13 @@ class ConditionalBlockingRateTest(unittest.TestCase):
             "把模型的对齐效果算成网关的战果",
         )
         self.assertEqual(m["n_uninformative"], 2)
+        self.assertEqual(m["ASR_model_ci"]["k"], 1)
+        self.assertEqual(m["ASR_model_ci"]["n"], 4)
+        self.assertEqual(m["CBR_ci"]["k"], 1)
+        self.assertEqual(m["CBR_ci"]["n"], 2, "CBR 的区间分母必须是易感条数，不是全部样本")
+        text = render({"meta": {"model": "m", "replay_only": True}, "metrics": m})
+        self.assertIn("不是换一个模型之后的方差", text)
+        self.assertIn("k=1/n=2", text)
 
     def test_cbr_is_none_when_model_never_took_the_bait(self) -> None:
         """模型一条都没中招时 CBR 不可计算，必须留空而不是记 100%。
@@ -81,6 +88,7 @@ class ConditionalBlockingRateTest(unittest.TestCase):
         """
         m = summarize([_o("s1", False, False), _o("s2", False, False)])
         self.assertIsNone(m["conditional_blocking_rate"])
+        self.assertIsNone(m["CBR_ci"], "没有易感样本时不给 CBR 区间，避免写成 0/0")
         self.assertEqual(m["ASR_model"], 0.0)
         self.assertEqual(m["model_susceptibility"], 0.0)
         # 渲染层也必须说人话，而不是打印一个 None

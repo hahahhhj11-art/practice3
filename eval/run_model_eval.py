@@ -58,6 +58,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from eval.run_eval import GROUPS, Trial, derive_policy, load_samples, run_trial  # noqa: E402
+from eval.stats import format_rate, rate_interval  # noqa: E402
 from trustgate.llm import LLMBackend, OpenAICompatibleLLM  # noqa: E402
 from trustgate.paths import project_root  # noqa: E402
 
@@ -189,24 +190,48 @@ def summarize(outcomes: list[PairedOutcome]) -> dict[str, Any]:
             "n": len(sub),
             "susceptible": len(sus),
             "ASR_model": pct([o for o in sub if o.defended_success], sub),
+            "ASR_model_ci": rate_interval(
+                sum(1 for o in sub if o.defended_success), len(sub)
+            ),
             # 分母是易感子集；该格模型一条都没中招时留 None 而不是写 0 或 100,
             # 否则汇总表上会出现一个凭空而来的"完美阻断"。
             "CBR": pct([o for o in sus if o.blocked_by_gateway], sus) if sus else None,
+            "CBR_ci": (
+                rate_interval(sum(1 for o in sus if o.blocked_by_gateway), len(sus))
+                if sus else None
+            ),
         }
 
     return {
         "n_samples": n,
         "model_susceptibility": pct(susceptible, outcomes),
+        "model_susceptibility_ci": rate_interval(len(susceptible), n) if n else None,
         "n_susceptible": len(susceptible),
         "ASR_model": pct(defended_hits, outcomes),
+        "ASR_model_ci": rate_interval(len(defended_hits), n) if n else None,
         "conditional_blocking_rate": pct(blocked, susceptible) if susceptible else None,
+        "CBR_ci": (
+            rate_interval(len(blocked), len(susceptible)) if susceptible else None
+        ),
         "n_uninformative": n - len(susceptible),
         "UA_defended": pct([o for o in outcomes if o.defended_task_done], outcomes),
+        "UA_defended_ci": rate_interval(
+            sum(1 for o in outcomes if o.defended_task_done), n
+        ) if n else None,
         "UA_undefended": pct([o for o in outcomes if o.undefended_task_done], outcomes),
+        "UA_undefended_ci": rate_interval(
+            sum(1 for o in outcomes if o.undefended_task_done), n
+        ) if n else None,
         "blocking_rules": dict(sorted(rules.items(), key=lambda kv: -kv[1])),
         "per_cell": per_cell,
         "errors": sum(len(o.errors) for o in outcomes),
     }
+
+
+def _fmt_ci(ci: dict[str, Any] | None) -> str:
+    if not ci:
+        return "—"
+    return format_rate(int(ci["k"]), int(ci["n"]))
 
 
 def render(report: dict[str, Any]) -> str:
@@ -216,18 +241,22 @@ def render(report: dict[str, Any]) -> str:
         f"真实模型实验 · {meta['model']} · {m['n_samples']} 条样本 "
         f"· {'离线回放' if meta['replay_only'] else '在线'}",
         "",
-        f"  模型易感性 S        {m['model_susceptibility']}%  "
+        f"  模型易感性 S        {_fmt_ci(m.get('model_susceptibility_ci'))}  "
         f"（{m['n_susceptible']}/{m['n_samples']} 条在无防护下真的中招）",
-        f"  ASR@model（C5）     {m['ASR_model']}%",
+        f"  ASR@model（C5）     {_fmt_ci(m.get('ASR_model_ci'))}",
     ]
     cbr = m["conditional_blocking_rate"]
     out.append(
-        f"  条件阻断率 CBR      {cbr}%  （只在上面那 {m['n_susceptible']} 条上算）"
+        f"  条件阻断率 CBR      {_fmt_ci(m.get('CBR_ci'))}  "
+        f"（只在上面那 {m['n_susceptible']} 条上算）"
         if cbr is not None
         else "  条件阻断率 CBR      不可计算：该模型在无防护下一条都没中招"
     )
     out += [
-        f"  任务效用 UA         无防护 {m['UA_undefended']}% → 全防护 {m['UA_defended']}%",
+        f"  任务效用 UA         无防护 {_fmt_ci(m.get('UA_undefended_ci'))}"
+        f" → 全防护 {_fmt_ci(m.get('UA_defended_ci'))}",
+        "  区间是这一次样本计数的 Wilson 95%，不是换一个模型之后的方差。",
+        "  CBR 的 n 是无防护下真的中招的条数，不是全部样本。",
         "",
     ]
     if m["n_uninformative"]:
@@ -243,13 +272,13 @@ def render(report: dict[str, Any]) -> str:
             "",
         ]
 
-    out.append("  按「攻击目标 / 规避层级」分格：")
-    out.append("    格                          n  易感  ASR@model  CBR")
+    out.append("  按「攻击目标 / 规避层级」分格（区间与上面同一口径）：")
     for cell, c in report["metrics"]["per_cell"].items():
-        cbr_s = "  —  " if c["CBR"] is None else f"{c['CBR']:>5}%"
+        # 该格没有易感样本时不给 CBR 区间。写 0 或 100 都是把没被考验过记成结果。
+        cbr_s = "—（该格无易感样本）" if c["CBR"] is None else _fmt_ci(c.get("CBR_ci"))
         out.append(
-            f"    {cell:<26} {c['n']:>2}  {c['susceptible']:>3}  "
-            f"{c['ASR_model']:>8}%  {cbr_s}"
+            f"    {cell}  n={c['n']}  易感={c['susceptible']}  "
+            f"ASR {_fmt_ci(c.get('ASR_model_ci'))}  CBR {cbr_s}"
         )
     if m["blocking_rules"]:
         out += ["", "  实际生效的拦截规则（只统计模型真的中招那些样本）："]
