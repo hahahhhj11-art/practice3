@@ -78,7 +78,18 @@ python -m eval.run_model_eval --replay-only            # 无 key 时用随仓库
 ```
 
 无 key 且无缓存时该管线以退出码 3 结束且**不输出任何数字**——给一个"未测"比给一个
-来源不明的数字有用。
+来源不明的数字有用。第三方套件和清单生成是同一条纪律：
+
+```bash
+python scripts/run_agentdojo.py --suite workspace --defense trustgate
+python scripts/run_manifest_eval.py --model gpt-4o-mini
+```
+
+两条在没有 `TG_API_KEY` 时都以退出码 3 结束，不打印比例。`run_agentdojo.py`
+把判定挂到 agentdojo 0.1.35 的工具执行器上；套件是单进程，复用的是规则，不是
+T1 锚进程，差异在 `docs/03` §9。`run_manifest_eval.py` 让模型在读外部内容之前
+生成能力清单，对照良性样本里的 `reference_manifest`，不对照评测装置垫到至少
+8 步的那份清单。离线单测不调用模型。
 
 ---
 
