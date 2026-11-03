@@ -302,12 +302,35 @@ class PolicyEngine:
                 f"不可逆操作 {call.tool} 的目标仅能溯源自不可信网页内容",
                 risk=spec.risk,
             )
+        # 字符串溯源对不上时是 UNKNOWN，不是拒绝。见过网页之后仍放行，
+        # 对手可以把路径拆成两段、从任务和网页各取一段拼回去，完整路径
+        # 和文件名都不整段出现，L2 又已经按目录前缀授权。这时只放行
+        # 用户任务里逐字写过的目标。污染之前的 UNKNOWN 仍交给清单，
+        # 否则「先按文件名拼路径、再去读网页」的正常顺序会被误杀。
+        if (
+            trust == Trust.UNKNOWN
+            and spec.irreversible
+            and state.taint.session_tainted
+        ):
+            return Decision(
+                "deny",
+                "L3.unknown_irreversible",
+                f"见过不可信内容后，不可逆操作 {call.tool} 的目标不在用户任务原文里",
+                risk=spec.risk,
+            )
 
         if trust == Trust.UNTRUSTED and call.tool == "fs.read":
             return Decision(
                 "deny",
                 "L3.untrusted_read_target",
                 "待读取路径来自不可信网页内容，而非用户任务",
+                risk=spec.risk,
+            )
+        if trust == Trust.UNKNOWN and call.tool == "fs.read" and state.taint.session_tainted:
+            return Decision(
+                "deny",
+                "L3.unknown_read_target",
+                "见过不可信内容后，待读取路径不在用户任务原文里",
                 risk=spec.risk,
             )
 
