@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import time
 from pathlib import Path
 
 from .paths import matches_any, resolve_sandbox_path
@@ -78,11 +79,24 @@ def fs_write(path: str, content: str, sandbox_root: str, max_bytes: int) -> Tool
         return ToolResult(ok=False, error=rp.error)
     p = Path(rp.abs)
     data = content.encode("utf-8")[:max_bytes]
-    existed = p.exists()
-    p.parent.mkdir(parents=True, exist_ok=True)
-    p.write_bytes(data)
-    verb = "覆盖" if existed else "创建"
-    return ToolResult(ok=True, content=f"已{verb} {rp.rel}（{len(data)} 字节）", sources=[f"file:{rp.rel}"])
+    # Windows 上刚被上一个样本读过的文件可能仍被占用。这是删除/写入语义，
+    # 不是拒绝：路径已经过沙箱收敛。占用时短退避，仍失败才把错误交回去。
+    last = "写入失败"
+    for i in range(6):
+        try:
+            existed = p.exists()
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_bytes(data)
+            verb = "覆盖" if existed else "创建"
+            return ToolResult(
+                ok=True, content=f"已{verb} {rp.rel}（{len(data)} 字节）", sources=[f"file:{rp.rel}"]
+            )
+        except PermissionError as exc:
+            last = f"写入被占用: {exc}"
+            if i == 5:
+                break
+            time.sleep(0.05 * (i + 1))
+    return ToolResult(ok=False, error=last)
 
 
 def fs_delete(path: str, sandbox_root: str) -> ToolResult:
