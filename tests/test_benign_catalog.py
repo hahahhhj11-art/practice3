@@ -68,6 +68,44 @@ class WilsonIntervalTest(unittest.TestCase):
     def test_empty_sample_is_defined(self) -> None:
         self.assertEqual(wilson_interval(0, 0), (0.0, 0.0))
 
+    def test_obedient_asr_interval_is_labeled_as_a_sample_count(self) -> None:
+        """ASR@obedient 的区间必须标明是样本数口径。
+
+        同格 96 条在 MockLLM 下是同一条试验。若报告只印一个区间、不写这句，
+        读者会把它读成模型显著性。
+        """
+        import importlib.util
+
+        spec = importlib.util.spec_from_file_location(
+            "report_table", ROOT / "scripts" / "report_table.py"
+        )
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        report = {
+            "meta": {"n_attack_samples": 2, "n_benign_samples": 1, "llm": "mock"},
+            "groups": {"C5": {
+                "ASR": 0.0, "UA": 100.0, "BTC": 100.0, "FPR_benign_calls": 0.0,
+                "confirm_rate_benign": 0.0, "flag_rate_calls": 0.0, "BR_calls": 0.0,
+                "latency_p50_ms": 1.0, "latency_p95_ms": 1.0,
+            }},
+            "trials": [
+                {"group": "C5", "target": "read", "evasion": "naive",
+                 "attack_success": False, "task_completed": True,
+                 "expect_layer": "L1", "blocking_rule": "L1.deny_list"},
+                {"group": "C5", "target": "read", "evasion": "naive",
+                 "attack_success": False, "task_completed": True,
+                 "expect_layer": "L1", "blocking_rule": "L1.deny_list"},
+                {"group": "C5", "target": "benign", "evasion": "",
+                 "attack_success": False, "task_completed": True,
+                 "calls": 2, "blocked": 0, "confirms": 0,
+                 "expect_layer": "", "blocking_rule": ""},
+            ],
+        }
+        text = mod.render(report, "mem")
+        self.assertIn("不是模型统计显著性", text)
+        self.assertIn("k=0/n=2", text)
+        self.assertNotIn("k=0/n=96", text)
+
 
 if __name__ == "__main__":
     unittest.main()

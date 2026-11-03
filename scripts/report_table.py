@@ -113,17 +113,25 @@ def render(report: dict, source: str) -> str:
             f"| {m['latency_p50_ms']:.3f}ms | {m['latency_p95_ms']:.3f}ms |"
         )
 
-    lines += ["", "## 良性任务 Wilson 95% 区间", ""]
+    lines += ["", "## Wilson 95% 区间", ""]
     lines.append("BTC 的 n 是良性任务条数；FPR 与确认率的 n 是良性调用次数。")
-    lines.append("区间只描述这一次运行的二项计数，不是换模型之后的方差。")
+    lines.append("ASR 与 UA 的 n 是本报告里的攻击样本条数，不是语料库里同格的 96 条。")
+    lines.append(
+        "ASR@obedient 的区间只描述这一次抽样的二项计数。同格样本的 sim_actions 相同，"
+        "MockLLM 不读注入文本，把 96 条算进 n 不会多出信息，也不等于模型统计显著性。"
+    )
+    lines.append("换一个模型之后的方差不在这些区间里。")
     lines.append("")
-    lines.append("| 组 | BTC | 良性 FPR | 良性确认率 |")
-    lines.append("| --- | --- | --- | --- |")
+    lines.append("| 组 | ASR | UA | BTC | 良性 FPR | 良性确认率 |")
+    lines.append("| --- | --- | --- | --- | --- | --- |")
     for gid in groups:
         ben = [t for t in trials if t.get("group") == gid and t.get("target") == "benign"]
+        atk = [t for t in trials if t.get("group") == gid and t.get("target") != "benign"]
         calls = sum(int(t.get("calls") or 0) for t in ben)
         lines.append(
-            f"| {gid} | {format_rate(sum(1 for t in ben if t.get('task_completed')), len(ben))} "
+            f"| {gid} | {format_rate(sum(1 for t in atk if t.get('attack_success')), len(atk))} "
+            f"| {format_rate(sum(1 for t in atk if t.get('task_completed')), len(atk))} "
+            f"| {format_rate(sum(1 for t in ben if t.get('task_completed')), len(ben))} "
             f"| {format_rate(sum(int(t.get('blocked') or 0) for t in ben), calls)} "
             f"| {format_rate(sum(int(t.get('confirms') or 0) for t in ben), calls)} |"
         )
@@ -180,6 +188,16 @@ def render(report: dict, source: str) -> str:
 
     c0 = groups.get("C0", {})
     c5 = groups.get("C5", {})
+
+    def _atk(gid: str) -> list[dict]:
+        return [t for t in trials if t.get("group") == gid and t.get("target") != "benign"]
+
+    def _ben(gid: str) -> list[dict]:
+        return [t for t in trials if t.get("group") == gid and t.get("target") == "benign"]
+
+    c5_atk = _atk("C5")
+    c5_ben = _ben("C5")
+    c5_calls = sum(int(t.get("calls") or 0) for t in c5_ben)
     lines += [
         "",
         "## 可粘贴摘要",
@@ -205,6 +223,15 @@ def render(report: dict, source: str) -> str:
             f"P50 {c5.get('latency_p50_ms', 0):.3f}ms、P95 {c5.get('latency_p95_ms', 0):.3f}ms。"
         ),
         f"C5 预期层对账：{n_ok} 格一致，{n_bad} 格偏离。",
+        (
+            "C5 区间："
+            f"ASR {format_rate(sum(1 for t in c5_atk if t.get('attack_success')), len(c5_atk))}；"
+            f"UA {format_rate(sum(1 for t in c5_atk if t.get('task_completed')), len(c5_atk))}；"
+            f"BTC {format_rate(sum(1 for t in c5_ben if t.get('task_completed')), len(c5_ben))}；"
+            f"FPR {format_rate(sum(int(t.get('blocked') or 0) for t in c5_ben), c5_calls)}；"
+            f"确认率 {format_rate(sum(int(t.get('confirms') or 0) for t in c5_ben), c5_calls)}。"
+        ),
+        "ASR 与 UA 的 n 是本报告攻击样本条数，不是同格 96 条。ASR@obedient 的区间是样本数口径，不是模型统计显著性。",
         "以上数字全部来自本报告 JSON，不要手改。",
     ]
     return "\n".join(lines)

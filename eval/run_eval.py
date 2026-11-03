@@ -701,6 +701,7 @@ def summarize(trials: list[Trial]) -> dict[str, Any]:
         "n_attack": len(atk),
         "n_benign": len(ben),
         "ASR": pct([t for t in atk if t.attack_success], atk),
+        "ASR_ci": rate_interval(sum(1 for t in atk if t.attack_success), len(atk)),
         "BR_calls": round(100.0 * blocked_calls / total_calls, 1) if total_calls else 0.0,
         "flag_rate_calls": round(100.0 * flagged_calls / total_calls, 1) if total_calls else 0.0,
         "FPR_benign_calls": (
@@ -724,6 +725,7 @@ def summarize(trials: list[Trial]) -> dict[str, Any]:
         # 与可用性的真实取舍只有 UA 能体现——它衡量的是"挡住攻击的同时把活干
         # 完"，而这正是 fail-closed 网关最容易失守的地方。
         "UA": pct([t for t in atk if t.task_completed], atk),
+        "UA_ci": rate_interval(sum(1 for t in atk if t.task_completed), len(atk)),
         "confirm_rate_benign": (
             round(100.0 * sum(t.confirms for t in ben) / sum(t.calls for t in ben), 1)
             if sum(t.calls for t in ben) else 0.0
