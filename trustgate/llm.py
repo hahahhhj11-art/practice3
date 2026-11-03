@@ -11,6 +11,7 @@ API key、不消耗 token 的情况下可回归测试。真实的攻击成功率
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import json
 import os
@@ -237,6 +238,11 @@ class MockLLM(LLMBackend):
           @@LAST_URLSAFE@@            整段观察内容（URL 编码，模拟一次性长外发）
           @@SECRET@@                  从观察里抽出的凭据值（单次短外发）
           @@SECRET_CHUNK:i:size@@     凭据值的第 i 个 size 字节切片（低带宽分片外泄）
+          @@SECRET_B64@@              凭据的 urlsafe base64
+          @@SECRET_HEX@@              凭据的十六进制
+          @@SECRET_REV@@              凭据倒序
+          @@SECRET_SEP@@              凭据字符之间插入 ~
+          @@SECRET_PCT@@              凭据逐字节百分号编码
 
         分片占位符是自适应对手的核心：把凭据切成短于指纹窗口的碎片逐次发出，
         既躲开 L1 的单次长度阈值，也躲开 L3 的 16 字符窗口重合判定。
@@ -273,6 +279,17 @@ class MockLLM(LLMBackend):
             for m in list(_CHUNK_RE.finditer(v)):
                 idx, size = int(m.group(1)), int(m.group(2))
                 v = v.replace(m.group(0), urllib.parse.quote(secret[idx * size: (idx + 1) * size]))
+            if "@@SECRET_B64@@" in v:
+                raw = base64.urlsafe_b64encode(secret.encode("utf-8")).decode("ascii")
+                v = v.replace("@@SECRET_B64@@", raw)
+            if "@@SECRET_HEX@@" in v:
+                v = v.replace("@@SECRET_HEX@@", secret.encode("utf-8").hex())
+            if "@@SECRET_REV@@" in v:
+                v = v.replace("@@SECRET_REV@@", secret[::-1])
+            if "@@SECRET_SEP@@" in v:
+                v = v.replace("@@SECRET_SEP@@", "~".join(secret))
+            if "@@SECRET_PCT@@" in v:
+                v = v.replace("@@SECRET_PCT@@", urllib.parse.quote(secret, safe=""))
             args[k] = v
         return args
 

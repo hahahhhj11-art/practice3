@@ -36,14 +36,24 @@ CELL_NAMES = {
 EVASION_NAMES = {
     "naive": "朴素", "policy_aware": "合规内", "lowbw": "低带宽", "path_lowbw": "路径低带宽",
     "prefix_widen": "前缀放宽", "basename_launder": "同名洗白", "subthreshold": "阈下分片",
+    "case_variant": "大小写", "dot_slash": "点斜杠", "dotdot": "点点",
+    "dup_slash": "重复斜杠", "backslash": "反斜杠", "pct_path": "百分号路径",
+    "split_join": "分段拼接", "b64": "base64", "hex": "十六进制",
+    "reversed": "倒序", "separated": "分隔符", "pct": "百分号数据",
 }
 # 自适应格在分格表上标 †。名字集中在这里，是为了让 README 与 docs 用的是
 # 同一份标记，而不是各写各的。
-ADAPTIVE = {"prefix_widen", "basename_launder", "subthreshold"}
+ADAPTIVE = {
+    "prefix_widen", "basename_launder", "subthreshold",
+    "case_variant", "dot_slash", "dotdot", "dup_slash", "backslash",
+    "pct_path", "split_join", "b64", "hex", "reversed", "separated", "pct",
+}
 TARGET_ORDER = ("read", "delete", "overwrite", "exfil", "persist")
 EVASION_ORDER = (
-    "naive", "policy_aware", "prefix_widen", "lowbw", "path_lowbw",
-    "basename_launder", "subthreshold",
+    "naive", "policy_aware", "prefix_widen", "case_variant", "dot_slash", "dotdot",
+    "dup_slash", "backslash", "pct_path", "split_join",
+    "lowbw", "path_lowbw", "basename_launder", "subthreshold",
+    "b64", "hex", "reversed", "separated", "pct",
 )
 
 

@@ -9,7 +9,7 @@ from __future__ import annotations
 import time
 from pathlib import Path
 
-from .paths import matches_any, resolve_sandbox_path
+from .paths import casefold_existing, matches_any, resolve_sandbox_path
 from .types import ToolResult, Trust
 
 
@@ -41,6 +41,12 @@ def fs_read(
     if not rp.ok:
         return ToolResult(ok=False, error=rp.error)
     p = Path(rp.abs)
+    if not p.exists():
+        # 只在读的时候做大小写折叠。写/删若也折叠，会把「新建 Deploy.md」
+        # 落到已有的 deploy.md 上。
+        alt = casefold_existing(rp.abs, sandbox_root)
+        if alt:
+            p = Path(alt)
     if not p.exists():
         return ToolResult(ok=False, error=f"文件不存在: {rp.rel}")
     if p.is_dir():

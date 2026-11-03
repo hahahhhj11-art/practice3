@@ -13,7 +13,7 @@ from __future__ import annotations
 import posixpath
 import re
 from dataclasses import dataclass, field
-from urllib.parse import urlparse
+from urllib.parse import unquote, urlparse
 
 from .dlp import SensitiveFingerprint
 from .sanitize import normalize_text
@@ -24,6 +24,20 @@ _MIN_TOKEN = 3
 
 def _norm(s: str) -> str:
     return normalize_text(str(s)).replace("\\", "/").lower()
+
+
+def _canon_selector(value: str) -> str:
+    """把一条路径或 URL 收成它实际指向的那个对象，再去做字符串比对。
+
+    只收这一条参数。整段网页若同样折叠，正文会被折成一条路径，溯源就废了。
+    百分号解码做两层：第二层是把 `%252e` 这种「百分号本身再编码」折回来。
+    再多的层数不再在这里追，那是内容变换，归外发目的地判断。
+    含 `://` 的值不做 normpath，否则 `http://` 会被折成 `http:/`。
+    """
+    text = unquote(unquote(_norm(value).strip()))
+    if "://" in text or text in ("", ".", ".."):
+        return text
+    return posixpath.normpath(text)
 
 
 def _candidate_sets(value: str) -> tuple[list[str], list[str]]:
@@ -44,8 +58,9 @@ def _candidate_sets(value: str) -> tuple[list[str], list[str]]:
     现实中 readme.md / notes.md / config.json 这类文件名遍地都是，攻击者
     几乎总能找到一个同名受害者。这与此前修掉的 URL 主机名洗白是同一类
     错误：把「同类」当成了「同一个」。
-    降级为 UNKNOWN 之后，宽松匹配仍不被硬拒，但必须另外命中能力清单才能
-    通过——这正是三值格里 UNKNOWN 一档当初被设计出来的用途。
+    降级为 UNKNOWN 之后，污染之前仍只要求命中能力清单。见过不可信内容之后，
+    fs.read 与不可逆操作上的 UNKNOWN 由策略拒绝（policy.py）：完整路径对不上
+    任何一段原文时，不能再靠「同名」或「两段拼起来」放行。
 
     URL 刻意不产生任何 loose 候选。早先把裸主机名放进候选集，等于宣称
     "任务里出现过 127.0.0.1" ⇒ "该主机下任意 URL 都可信"，攻击者的外泄地址
@@ -54,7 +69,7 @@ def _candidate_sets(value: str) -> tuple[list[str], list[str]]:
     主机名是**权限**问题，归 L1 的域名允许列表管；溯源回答的是**这个具体
     地址是不是用户要求访问的**，粒度必须是整条 URL。
     """
-    v = _norm(value).strip()
+    v = _canon_selector(value)
     if len(v) < _MIN_TOKEN:
         return [], []
     if "://" in v:
