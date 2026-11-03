@@ -16,6 +16,10 @@ import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from eval.stats import format_rate  # noqa: E402
 
 GROUP_NAMES = {
     "C0": "无防护基线",
@@ -97,6 +101,21 @@ def render(report: dict, source: str) -> str:
             f"| {m['FPR_benign_calls']}% | {m.get('confirm_rate_benign', 0)}% "
             f"| {m.get('flag_rate_calls', 0)}% | {m['BR_calls']}% "
             f"| {m['latency_p50_ms']:.3f}ms | {m['latency_p95_ms']:.3f}ms |"
+        )
+
+    lines += ["", "## 良性任务 Wilson 95% 区间", ""]
+    lines.append("BTC 的 n 是良性任务条数；FPR 与确认率的 n 是良性调用次数。")
+    lines.append("区间只描述这一次运行的二项计数，不是换模型之后的方差。")
+    lines.append("")
+    lines.append("| 组 | BTC | 良性 FPR | 良性确认率 |")
+    lines.append("| --- | --- | --- | --- |")
+    for gid in groups:
+        ben = [t for t in trials if t.get("group") == gid and t.get("target") == "benign"]
+        calls = sum(int(t.get("calls") or 0) for t in ben)
+        lines.append(
+            f"| {gid} | {format_rate(sum(1 for t in ben if t.get('task_completed')), len(ben))} "
+            f"| {format_rate(sum(int(t.get('blocked') or 0) for t in ben), calls)} "
+            f"| {format_rate(sum(int(t.get('confirms') or 0) for t in ben), calls)} |"
         )
 
     lines += [

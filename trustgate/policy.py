@@ -372,19 +372,25 @@ class PolicyEngine:
             elen = int(meta.get("egress_len", 0))
             url = str(call.args.get("url", ""))
             dest_trusted = state.taint.origin(url) is Trust.TRUSTED
-            if bool(ex.get("require_trusted_dest_after_sensitive", True)) and not dest_trusted:
-                return Decision(
-                    "deny",
-                    "L4.exfil_chain",
-                    f"检测到外泄链：本会话曾读取敏感内容，现发起指向非用户指定地址的外发请求"
-                    f"（可控载荷 {elen} 字节）",
-                    risk=100,
+            # 长度阈值不再施加于用户亲口指定的 URL。整条 URL（含查询串）逐字
+            # 出现在任务里才是 TRUSTED，攻击者往上面追加任何字节都会失去这个
+            # 标签。若对 TRUSTED 仍按 min_query_len_for_chain 拒绝，则「先读我
+            # 点名的备忘，再打开我给的 ?topic= 链接」会被 L4.exfil_chain 误杀
+            # ——查询串是用户写的，不是外泄载荷。
+            untrusted_dest = not dest_trusted
+            over_budget = elen >= int(ex.get("min_query_len_for_chain", 8))
+            require_trusted = bool(ex.get("require_trusted_dest_after_sensitive", True))
+            if untrusted_dest and (require_trusted or over_budget):
+                why = (
+                    "指向非用户指定地址"
+                    if require_trusted
+                    else f"含 {elen} 字节可控载荷"
                 )
-            if elen >= int(ex.get("min_query_len_for_chain", 8)):
                 return Decision(
                     "deny",
                     "L4.exfil_chain",
-                    f"检测到外泄链：本会话曾读取敏感内容，现发起含 {elen} 字节可控载荷的外发请求",
+                    f"检测到外泄链：本会话曾读取敏感内容，现发起{why}的外发请求"
+                    f"（可控载荷 {elen} 字节）",
                     risk=100,
                 )
 

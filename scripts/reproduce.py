@@ -56,6 +56,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+from eval.benign_tasks import N_BENIGN
 from trustgate.confine import probe
 
 # 复现规模。两档的差别只在主实验与良性样本条数上——判定逻辑、策略、
@@ -67,8 +68,8 @@ from trustgate.confine import probe
 # 写死 --limit 12 的话，新增的格会静默取不到样本，消融表上凭空出现空列。
 SCALES: dict[str, dict[str, int]] = {
     "quick": {"per_cell": 1, "eval_benign": 3},
-    # 每格 2 条 + 8 条良性，即 README 主表的取值
-    "full": {"per_cell": 2, "eval_benign": 8},
+    # 每格 2 条 + 良性目录全长。目录条数写在 eval/benign_tasks.py，这里不另抄一份。
+    "full": {"per_cell": 2, "eval_benign": N_BENIGN},
 }
 # 只在 index.json 读不到时兜底。数值取自本文件写就时的格数，纯粹为了
 # 让"样本集缺失"这种情况下的报错信息还算有意义。

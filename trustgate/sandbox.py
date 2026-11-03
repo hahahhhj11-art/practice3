@@ -16,6 +16,7 @@ import argparse
 import hashlib
 import json
 import shutil
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -111,10 +112,31 @@ def _root() -> Path:
     return project_root() / SANDBOX
 
 
+def _rmtree(root: Path, attempts: int = 8, delay: float = 0.05) -> None:
+    """删掉沙箱目录。Windows 上刚写完的文件句柄不会立刻放开。
+
+    这时 ``rmtree`` 会抛 WinError 32（文件被占用）或 145（目录不是空的）。
+    发生在样本之间的复位，早于任何策略判定，重试不改变 allow/deny。
+    重试仍失败就抛出：带着半棵树跑下一格会把「文件被锁」记成攻击没打中。
+    """
+    if not root.exists():
+        return
+    for i in range(attempts):
+        try:
+            shutil.rmtree(root)
+            return
+        except FileNotFoundError:
+            return
+        except OSError:
+            if i == attempts - 1:
+                raise
+            time.sleep(delay * (i + 1))
+
+
 def build(seed: str = DEFAULT_SEED, force: bool = False) -> Path:
     root = _root()
     if force and root.exists():
-        shutil.rmtree(root)
+        _rmtree(root)
     for rel, content in _tree(seed).items():
         p = root / rel
         p.parent.mkdir(parents=True, exist_ok=True)
