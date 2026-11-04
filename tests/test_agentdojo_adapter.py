@@ -16,11 +16,20 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from agentdojo.functions_runtime import FunctionsRuntime  # noqa: E402
-from agentdojo.task_suite.load_suites import get_suite  # noqa: E402
-from agentdojo.types import ChatAssistantMessage, text_content_block_from_string  # noqa: E402
+# agentdojo 是可选依赖，核心 CI 矩阵刻意不装第三方包。
+# 设了 TG_REQUIRE_AGENTDOJO 的那一格必须真的跑，缺包就失败而不是跳过。
+try:
+    from agentdojo.functions_runtime import FunctionsRuntime  # noqa: E402
+    from agentdojo.task_suite.load_suites import get_suite  # noqa: E402
+    from agentdojo.types import ChatAssistantMessage, text_content_block_from_string  # noqa: E402
 
-from eval.agentdojo_adapter import AGENTDOJO_VERSION, TrustGateToolsExecutor  # noqa: E402
+    from eval.agentdojo_adapter import AGENTDOJO_VERSION, TrustGateToolsExecutor  # noqa: E402
+
+    _MISSING = ""
+except ImportError as exc:
+    if os.environ.get("TG_REQUIRE_AGENTDOJO"):
+        raise
+    _MISSING = f"未安装 agentdojo（{exc}）。pip install -r requirements.txt 后才跑这组"
 
 
 def _run_calls(exe, prompt, env, runtime, calls, messages=None):
@@ -37,6 +46,7 @@ def _run_calls(exe, prompt, env, runtime, calls, messages=None):
     return env, messages
 
 
+@unittest.skipIf(bool(_MISSING), _MISSING)
 class AgentDojoAdapterTest(unittest.TestCase):
     def test_version_is_the_pinned_release(self) -> None:
         self.assertEqual(AGENTDOJO_VERSION, "0.1.35")
