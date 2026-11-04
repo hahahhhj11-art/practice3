@@ -135,6 +135,40 @@ class AgentDojoScriptTest(unittest.TestCase):
         self.assertNotIn("extra_content", calls[1], "没见过的调用 id 不能被补上签名")
         self.assertNotIn("extra_content", call, "不能原地改调用方的消息")
 
+    def _flaky(self, replies):
+        from types import SimpleNamespace
+
+        from scripts.run_agentdojo import ThoughtSignatureClient
+
+        it = iter(replies)
+        calls = {"n": 0}
+
+        def create(**kw):
+            calls["n"] += 1
+            return SimpleNamespace(choices=[SimpleNamespace(message=next(it))])
+
+        inner = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=create)))
+        return ThoughtSignatureClient(inner, empty_retries=2), calls
+
+    def test_empty_reply_is_retried(self) -> None:
+        from types import SimpleNamespace
+
+        ok = SimpleNamespace(tool_calls=None, content="done")
+        client, calls = self._flaky([None, ok])
+        resp = client.chat.completions.create(model="m", messages=[])
+        self.assertIs(resp.choices[0].message, ok)
+        self.assertEqual(calls["n"], 2)
+        self.assertEqual(client.empty_replies, 0, "重试成功的不算空回复")
+
+    @unittest.skipIf(bool(_MISSING), _MISSING)
+    def test_persistent_empty_reply_is_counted_not_hidden(self) -> None:
+        client, calls = self._flaky([None, None, None])
+        resp = client.chat.completions.create(model="m", messages=[])
+        self.assertEqual(calls["n"], 3)
+        self.assertEqual(resp.choices[0].message.content, "")
+        self.assertIsNone(resp.choices[0].message.tool_calls)
+        self.assertEqual(client.empty_replies, 1)
+
 
 if __name__ == "__main__":
     unittest.main()
