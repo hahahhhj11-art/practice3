@@ -99,6 +99,32 @@ class AgentDojoScriptTest(unittest.TestCase):
         self.assertNotIn("%", blob)
         self.assertNotRegex(blob, r"\d+\s*/\s*\d+")
 
+    def test_thought_signature_is_carried_into_the_next_turn(self) -> None:
+        from types import SimpleNamespace
+
+        from scripts.run_agentdojo import ThoughtSignatureClient
+
+        sent: list[list[dict]] = []
+
+        def create(**kw):
+            sent.append(kw["messages"])
+            tc = SimpleNamespace(id="c1", extra_content={"google": {"thought_signature": "sig"}})
+            return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(tool_calls=[tc]))])
+
+        client = ThoughtSignatureClient(SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=create))))
+        client.chat.completions.create(model="m", messages=[{"role": "user", "content": "x"}])
+        call = {"id": "c1", "type": "function", "function": {"name": "f", "arguments": "{}"}}
+        other = {"id": "c2", "type": "function", "function": {"name": "g", "arguments": "{}"}}
+        client.chat.completions.create(
+            model="m",
+            messages=[{"role": "assistant", "content": None, "tool_calls": [call, other]},
+                      {"role": "tool", "tool_call_id": "c1", "content": "ok"}],
+        )
+        calls = sent[-1][0]["tool_calls"]
+        self.assertEqual(calls[0]["extra_content"], {"google": {"thought_signature": "sig"}})
+        self.assertNotIn("extra_content", calls[1], "没见过的调用 id 不能被补上签名")
+        self.assertNotIn("extra_content", call, "不能原地改调用方的消息")
+
 
 if __name__ == "__main__":
     unittest.main()
