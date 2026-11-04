@@ -16,6 +16,7 @@ import hashlib
 import json
 import os
 import re
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -296,6 +297,17 @@ class MockLLM(LLMBackend):
 
 # ---------------------------------------------------------------- 真实模型后端
 
+class LLMTransportError(RuntimeError):
+    """请求没有拿到模型的回答：网络、超时、限流或服务端 5xx。
+
+    与模型输出无法解析区分开。前者是实验装置故障，样本不能计入任何分母；
+    后者是模型自己的行为，照常计分。
+    """
+
+
+_TRANSIENT_HTTP = {408, 429, 500, 502, 503, 504}
+
+
 class OpenAICompatibleLLM(LLMBackend):
     """OpenAI 兼容 /chat/completions 后端，可接 DeepSeek / 通义 / vLLM / Ollama。
 
@@ -312,8 +324,12 @@ class OpenAICompatibleLLM(LLMBackend):
         cache_path: str = "logs/llm_cache.jsonl",
         replay_only: bool = False,
         spotlight: bool = True,
+        retries: int = 2,
+        backoff_s: float = 5.0,
     ):
         self.name = f"openai:{model}"
+        self.retries = retries
+        self.backoff_s = backoff_s
         self.model = model
         self.base_url = (base_url or os.environ.get("TG_BASE_URL") or "https://api.openai.com/v1").rstrip("/")
         self.api_key = api_key or os.environ.get("TG_API_KEY") or ""
@@ -355,11 +371,22 @@ class OpenAICompatibleLLM(LLMBackend):
                 "Authorization": f"Bearer {self.api_key}",
             },
         )
-        try:
-            with urllib.request.urlopen(req, timeout=90) as resp:
-                data = json.loads(resp.read().decode("utf-8"))
-        except urllib.error.HTTPError as exc:
-            raise RuntimeError(f"LLM HTTP {exc.code}: {exc.read()[:400]!r}") from exc
+        data: dict[str, Any] = {}
+        for attempt in range(self.retries + 1):
+            try:
+                with urllib.request.urlopen(req, timeout=90) as resp:
+                    data = json.loads(resp.read().decode("utf-8"))
+                break
+            except urllib.error.HTTPError as exc:
+                detail = f"LLM HTTP {exc.code}: {exc.read()[:400]!r}"
+                if exc.code not in _TRANSIENT_HTTP:
+                    raise RuntimeError(detail) from exc
+                if attempt == self.retries:
+                    raise LLMTransportError(detail) from exc
+            except (urllib.error.URLError, TimeoutError, ConnectionError) as exc:
+                if attempt == self.retries:
+                    raise LLMTransportError(f"模型通道故障: {exc}") from exc
+            time.sleep(self.backoff_s * (2 ** attempt))
         text = data["choices"][0]["message"]["content"]
 
         self.cache_path.parent.mkdir(parents=True, exist_ok=True)

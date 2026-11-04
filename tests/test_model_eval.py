@@ -131,6 +131,118 @@ class ConditionalBlockingRateTest(unittest.TestCase):
         self.assertEqual(m["UA_undefended"], 100.0)
         self.assertEqual(m["UA_defended"], 50.0)
 
+    def test_transport_failure_is_excluded_not_counted_as_refusal(self) -> None:
+        """请求没送达的样本记成「模型未中招」，会凭空抬高模型的抗注入率。"""
+        lost = _o("s2", False, False, u_done=False, d_done=False)
+        lost.transport_failed = True
+        m = summarize([_o("s1", True, False), lost])
+        self.assertEqual(m["n_attempted"], 2)
+        self.assertEqual(m["n_transport_failed"], 1)
+        self.assertEqual(m["n_samples"], 1)
+        self.assertEqual(m["model_susceptibility"], 100.0)
+        self.assertEqual(m["n_uninformative"], 0)
+        self.assertEqual(m["UA_undefended_ci"]["n"], 1)
+        text = render({"meta": {"model": "m", "replay_only": True}, "metrics": m})
+        self.assertIn("1/2 条模型请求没送达", text)
+
+    def test_skipped_defended_arm_is_not_counted_as_task_failure(self) -> None:
+        """无防护臂没中招时防护臂不跑。把这些样本记成防护臂「任务未完成」，
+        会凭空造出防御的效用损失。"""
+        skipped = _o("s2", False, False, u_done=True, d_done=False)
+        skipped.defended_ran = False
+        m = summarize([_o("s1", True, False, u_done=True, d_done=True), skipped])
+        self.assertEqual(m["n_defended_ran"], 1)
+        self.assertEqual(m["UA_defended"], 100.0)
+        self.assertEqual(m["UA_defended_ci"]["n"], 1)
+        self.assertEqual(m["UA_undefended_paired_ci"]["n"], 1)
+        self.assertEqual(m["UA_undefended"], 100.0)
+
+        none_ran = _o("s3", False, False, d_done=False)
+        none_ran.defended_ran = False
+        m = summarize([none_ran])
+        self.assertIsNone(m["UA_defended"])
+        self.assertIsNone(m["UA_defended_ci"])
+        text = render({"meta": {"model": "m", "replay_only": True}, "metrics": m})
+        self.assertIn("全防护 不可计算", text)
+        self.assertNotIn("None%", text)
+
+
+class TransportErrorTest(unittest.TestCase):
+    """只有「没拿到回答」才是装置故障；4xx 的请求错误不能被吞成故障而剔出分母。"""
+
+    def _serve(self, status: int):
+        import http.server
+        import threading
+
+        hits = {"n": 0}
+
+        class H(http.server.BaseHTTPRequestHandler):
+            def do_POST(self):
+                hits["n"] += 1
+                self.rfile.read(int(self.headers.get("Content-Length", 0)))
+                self.send_response(status)
+                self.end_headers()
+                self.wfile.write(b"{}")
+
+            def log_message(self, *a):
+                pass
+
+        srv = http.server.HTTPServer(("127.0.0.1", 0), H)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        self.addCleanup(srv.server_close)
+        self.addCleanup(srv.shutdown)
+        return f"http://127.0.0.1:{srv.server_address[1]}", hits
+
+    def _llm(self, base_url: str):
+        from trustgate.llm import OpenAICompatibleLLM
+
+        return OpenAICompatibleLLM(
+            model="m", base_url=base_url, api_key="k", retries=1, backoff_s=0.0,
+            cache_path="logs/test-transport-cache.jsonl",
+        )
+
+    def test_5xx_is_retried_then_reported_as_transport_failure(self) -> None:
+        from trustgate.llm import LLMTransportError
+
+        url, hits = self._serve(503)
+        with self.assertRaises(LLMTransportError):
+            self._llm(url)._chat([{"role": "user", "content": "x"}])
+        self.assertEqual(hits["n"], 2, "retries=1 应当共发两次")
+
+    def test_4xx_is_not_a_transport_failure(self) -> None:
+        from trustgate.llm import LLMTransportError
+
+        url, hits = self._serve(400)
+        with self.assertRaises(RuntimeError) as ctx:
+            self._llm(url)._chat([{"role": "user", "content": "x"}])
+        self.assertNotIsInstance(ctx.exception, LLMTransportError)
+        self.assertEqual(hits["n"], 1, "请求本身有错时重试没有意义")
+
+    def test_dropped_connection_is_transport_failure(self) -> None:
+        # 不连已关闭的端口：Windows 上回环拒连的耗时不确定
+        import socket
+        import threading
+
+        from trustgate.llm import LLMTransportError
+
+        lsn = socket.socket()
+        lsn.bind(("127.0.0.1", 0))
+        lsn.listen()
+        self.addCleanup(lsn.close)
+
+        def drop() -> None:
+            for _ in range(2):
+                try:
+                    conn, _addr = lsn.accept()
+                except OSError:
+                    return
+                conn.recv(65536)
+                conn.close()
+
+        threading.Thread(target=drop, daemon=True).start()
+        with self.assertRaises(LLMTransportError):
+            self._llm(f"http://127.0.0.1:{lsn.getsockname()[1]}")._chat([{"role": "user", "content": "x"}])
+
 
 class PreflightTest(unittest.TestCase):
     def test_preflight_reports_missing_prerequisites_without_probing(self) -> None:
