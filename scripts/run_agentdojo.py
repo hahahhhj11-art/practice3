@@ -22,6 +22,41 @@ SUITES = ("workspace", "banking", "slack", "travel")
 DEFENSES = ("none", "trustgate")
 
 
+class ThoughtSignatureClient:
+    """把工具调用上的 ``extra_content`` 回填进下一轮请求。
+
+    Gemini 3 的 OpenAI 兼容接口要求多轮工具调用带回上一轮的 thought_signature，
+    缺了直接 400。AgentDojo 的 ``OpenAILLM`` 在消息往返时只保留 id / 函数名 /
+    参数，会把它丢掉。不返回该字段的接口上这一层什么也不做。
+    """
+
+    def __init__(self, client: object):
+        from types import SimpleNamespace
+
+        self._client = client
+        self._extra: dict[str, object] = {}
+        self.chat = SimpleNamespace(completions=SimpleNamespace(create=self._create))
+
+    def _create(self, **kw: object) -> object:
+        kw["messages"] = [self._restore(m) for m in kw.get("messages") or []]
+        resp = self._client.chat.completions.create(**kw)  # type: ignore[attr-defined]
+        for choice in getattr(resp, "choices", None) or []:
+            for tc in getattr(choice.message, "tool_calls", None) or []:
+                extra = getattr(tc, "extra_content", None) or (getattr(tc, "model_extra", None) or {}).get("extra_content")
+                if extra and tc.id:
+                    self._extra[tc.id] = extra
+        return resp
+
+    def _restore(self, msg: object) -> object:
+        if not isinstance(msg, dict) or msg.get("role") != "assistant" or not msg.get("tool_calls"):
+            return msg
+        calls = []
+        for tc in msg["tool_calls"]:
+            extra = self._extra.get(tc.get("id", ""))
+            calls.append({**tc, "extra_content": extra} if extra and "extra_content" not in tc else tc)
+        return {**msg, "tool_calls": calls}
+
+
 def main(argv: list[str] | None = None) -> int:
     for stream in (sys.stdout, sys.stderr):
         if hasattr(stream, "reconfigure"):
@@ -37,6 +72,7 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--attack", default="direct")
     ap.add_argument("--user-task", action="append", default=[], help="只跑这些用户任务 id，可重复")
     ap.add_argument("--audit", default="logs/agentdojo-audit.jsonl")
+    ap.add_argument("--logdir", default="logs/agentdojo-runs", help="AgentDojo 逐条轨迹的落盘目录")
     ns = ap.parse_args(argv)
 
     if not os.environ.get("TG_API_KEY", "").strip():
@@ -60,6 +96,7 @@ def _run(ns: argparse.Namespace) -> int:
     import agentdojo.attacks  # noqa: F401  注册攻击名，否则 load_attack 找不到
     from agentdojo.attacks.attack_registry import load_attack
     from agentdojo.benchmark import benchmark_suite_with_injections
+    from agentdojo.logging import OutputLogger
     from agentdojo.task_suite.load_suites import get_suite
 
     from eval.agentdojo_adapter import AGENTDOJO_VERSION, TrustGateToolsExecutor
@@ -68,7 +105,7 @@ def _run(ns: argparse.Namespace) -> int:
         api_key=os.environ["TG_API_KEY"],
         base_url=(os.environ.get("TG_BASE_URL") or "https://api.openai.com/v1").rstrip("/"),
     )
-    llm = OpenAILLM(client, ns.model)
+    llm = OpenAILLM(ThoughtSignatureClient(client), ns.model)  # type: ignore[arg-type]
     system = SystemMessage(load_system_message(None))
     if ns.defense == "trustgate":
         tools = TrustGateToolsExecutor(audit_path=ns.audit)
@@ -82,15 +119,19 @@ def _run(ns: argparse.Namespace) -> int:
     suite = get_suite(ns.version, ns.suite)
     attack = load_attack(ns.attack, suite, pipeline)
     user_tasks = ns.user_task or None
-    results = benchmark_suite_with_injections(
-        pipeline,
-        suite,
-        attack,
-        logdir=None,
-        force_rerun=True,
-        user_tasks=user_tasks,
-        benchmark_version=ns.version,
-    )
+    logdir = ROOT / ns.logdir
+    logdir.mkdir(parents=True, exist_ok=True)
+    # TraceLogger 要从外层 OutputLogger 取 logdir；没有这一层会落到 NullLogger 上直接抛错
+    with OutputLogger(str(logdir), live=None):
+        results = benchmark_suite_with_injections(
+            pipeline,
+            suite,
+            attack,
+            logdir=logdir,
+            force_rerun=True,
+            user_tasks=user_tasks,
+            benchmark_version=ns.version,
+        )
     utility = results["utility_results"]
     security = results["security_results"]
     # AgentDojo 的 security() 为真表示注入目标达成，也就是攻击成功。
