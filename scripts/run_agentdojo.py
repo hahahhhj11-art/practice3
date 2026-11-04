@@ -70,6 +70,9 @@ def main(argv: list[str] | None = None) -> int:
     # direct 不要求流水线名字能映射到 AgentDojo 的模型表。
     # important_instructions 会在名字对不上时直接抛错，默认不用它。
     ap.add_argument("--attack", default="direct")
+    ap.add_argument("--model-prose", default="",
+                    help="攻击文本里对模型的称呼，模型不在 AgentDojo 的 MODEL_NAMES 表里时必须给，"
+                         "例如 Gemini 系列在该表里统一是 \"AI model developed by Google\"")
     ap.add_argument("--user-task", action="append", default=[], help="只跑这些用户任务 id，可重复")
     ap.add_argument("--audit", default="logs/agentdojo-audit.jsonl")
     ap.add_argument("--logdir", default="logs/agentdojo-runs", help="AgentDojo 逐条轨迹的落盘目录")
@@ -116,6 +119,10 @@ def _run(ns: argparse.Namespace) -> int:
     pipeline = AgentPipeline([system, InitQuery(), llm, ToolsExecutionLoop([tools, llm])])
     pipeline.name = f"{ns.model}-{defense_name}"
 
+    if ns.model_prose:
+        from agentdojo.models import MODEL_NAMES
+
+        MODEL_NAMES[ns.model] = ns.model_prose
     suite = get_suite(ns.version, ns.suite)
     attack = load_attack(ns.attack, suite, pipeline)
     user_tasks = ns.user_task or None
