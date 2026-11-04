@@ -91,6 +91,12 @@ T1 锚进程，差异在 `docs/03` §9。`run_manifest_eval.py` 让模型在读�
 生成能力清单，对照良性样本里的 `reference_manifest`，不对照评测装置垫到至少
 8 步的那份清单。离线单测不调用模型。
 
+`agentdojo` 是唯一的第三方依赖，只给这条脚本用：`pip install -r requirements.txt`。
+接 Gemini 时把 `TG_BASE_URL` 设为 `https://generativelanguage.googleapis.com/v1beta/openai`；
+AgentDojo 的 `important_instructions` 攻击要求模型名在它的称呼表里，表外型号用
+`--model-prose` 显式给出。AgentDojo 一对任务要多轮长提示，花费远高于本项目自己的
+两臂实验，先用 `--user-task` 跑小样本估算。已有的实测与它们不能支撑的结论见 `docs/03` §10。
+
 ---
 
 ## 架构
