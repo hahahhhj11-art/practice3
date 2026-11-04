@@ -30,16 +30,33 @@ class ThoughtSignatureClient:
     参数，会把它丢掉。不返回该字段的接口上这一层什么也不做。
     """
 
-    def __init__(self, client: object):
+    def __init__(self, client: object, empty_retries: int = 2):
         from types import SimpleNamespace
 
         self._client = client
         self._extra: dict[str, object] = {}
+        self._empty_retries = empty_retries
+        # 重试后仍没有 message 的次数。按「模型无输出」计分，结果里必须报出来
+        self.empty_replies = 0
         self.chat = SimpleNamespace(completions=SimpleNamespace(create=self._create))
 
     def _create(self, **kw: object) -> object:
         kw["messages"] = [self._restore(m) for m in kw.get("messages") or []]
-        resp = self._client.chat.completions.create(**kw)  # type: ignore[attr-defined]
+        for _ in range(self._empty_retries + 1):
+            resp = self._client.chat.completions.create(**kw)  # type: ignore[attr-defined]
+            choices = getattr(resp, "choices", None) or []
+            if choices and all(getattr(c, "message", None) is not None for c in choices):
+                break
+        else:
+            if not choices:
+                raise RuntimeError("模型返回里没有 choices")
+            from openai.types.chat import ChatCompletionMessage
+
+            # AgentDojo 读 message.tool_calls 时遇到 None 会让整次评测崩掉
+            for c in choices:
+                if getattr(c, "message", None) is None:
+                    c.message = ChatCompletionMessage(role="assistant", content="")
+                    self.empty_replies += 1
         for choice in getattr(resp, "choices", None) or []:
             for tc in getattr(choice.message, "tool_calls", None) or []:
                 extra = getattr(tc, "extra_content", None) or (getattr(tc, "model_extra", None) or {}).get("extra_content")
@@ -108,7 +125,8 @@ def _run(ns: argparse.Namespace) -> int:
         api_key=os.environ["TG_API_KEY"],
         base_url=(os.environ.get("TG_BASE_URL") or "https://api.openai.com/v1").rstrip("/"),
     )
-    llm = OpenAILLM(ThoughtSignatureClient(client), ns.model)  # type: ignore[arg-type]
+    sig_client = ThoughtSignatureClient(client)
+    llm = OpenAILLM(sig_client, ns.model)  # type: ignore[arg-type]
     system = SystemMessage(load_system_message(None))
     if ns.defense == "trustgate":
         tools = TrustGateToolsExecutor(audit_path=ns.audit)
@@ -150,6 +168,7 @@ def _run(ns: argparse.Namespace) -> int:
     print(f"用户任务完成 {sum(1 for ok in utility.values() if ok)} / {len(utility)}")
     print(f"注入目标达成 {attacked} / {n}")
     print(f"注入目标未达成 {n - attacked} / {n}")
+    print(f"模型空回复（重试 {sig_client._empty_retries} 次后仍为空，按无输出计分）{sig_client.empty_replies} 次")
     return 0
 
 
