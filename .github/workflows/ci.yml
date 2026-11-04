@@ -226,3 +226,24 @@ jobs:
             logs/*.json
             logs/*.jsonl
           if-no-files-found: warn
+
+  # agentdojo 是第三方基准，只有适配层的测试需要它。核心矩阵保持零依赖、
+  # 在那里这组测试按缺包跳过；这一格单独装包，并用 TG_REQUIRE_AGENTDOJO
+  # 把「缺包跳过」变成失败，免得它在所有格上都静默跳过。不调用任何模型。
+  agentdojo-adapter:
+    name: AgentDojo 适配层（ubuntu · 装 requirements.txt）
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: pip install -r requirements.txt
+        run: python -m pip install -r requirements.txt
+      - name: 适配层离线测试
+        shell: bash
+        env:
+          PYTHONUTF8: "1"
+          PYTHONIOENCODING: "utf-8"
+          TG_REQUIRE_AGENTDOJO: "1"
+        run: python -m unittest tests.test_agentdojo_adapter -v
