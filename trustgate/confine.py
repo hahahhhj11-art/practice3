@@ -21,19 +21,30 @@ S1 ``process``  Agent 独立进程 + 能力面裁剪（不可导入工具模块�
                 清洗、字节码不落盘）。**不是 OS 强制**：进程仍以用户身份
                 运行，``open()`` 依然可用。如实标记 ``os_enforced=False``。
 S2 ``os``       S1 之上叠加内核强制。Linux 用 Landlock（路径粒度文件系统
-                白名单）+ seccomp-BPF（禁止 AF_INET/AF_INET6 socket）。
-                Windows 只能做到 Job Object 生命周期约束，文件与网络无内核
-                强制——这个缺口写在 ``gaps`` 里，不靠措辞含糊过去。
+                白名单；网络规则仅 TCP bind/connect）+ seccomp-BPF（拒绝
+                一切 ``socket`` / ``socketpair``，以及 ``io_uring_setup`` /
+                ``enter`` / ``register``；架构不匹配与 x32 调用号返回
+                EPERM）。Windows 只能做到 Job Object 生命周期约束，文件与
+                网络无内核强制——这个缺口写在 ``gaps`` 里，不靠措辞含糊过去。
 
 S2 在 Linux 上的确切保证（可测，且刻意不夸大）
 --------------------------------------------
 被剥权进程无论执行任何代码：
   1. 读不到、也写不了 ``sandbox/`` 下的任何路径；
   2. 在**整个**文件系统上没有写权限（scratch 白名单除外）；
-  3. 开不出 AF_INET / AF_INET6 socket，因此无法直连网络。
-明确**不**保证：读不到 ``/usr``、``/etc`` 等运行 Python 必需的系统目录。
-这些不在资产集合内——受保护资产是沙箱文件树与网络出口。把「什么没保护」
-写清楚，比声称「全隔离」更有用。
+  3. 不能新建套接字。``socket`` 与 ``socketpair`` 对所有 domain（含
+     AF_UNIX）返回 EPERM；``io_uring_setup`` / ``io_uring_enter`` /
+     ``io_uring_register`` 同样拒绝，避免 IORING_OP_SOCKET 绕过
+     ``socket``。x86_64 上 ``nr >= 0x40000000`` 的 x32 调用，以及 arch
+     与当前 ABI 不符的入口（含 i386 ``int 0x80`` 的 socketcall），也返回
+     EPERM——系统调用不会被执行。
+明确**不**保证：
+  - 读不到 ``/usr``、``/etc`` 等运行 Python 必需的系统目录（不在资产集合内）；
+  - 收回施加前已经打开的文件描述符（父进程只把管道交给子进程）；
+  - 靠 Landlock 自己拦住 UDP 或按路径的 Unix socket——这两类靠上面的
+    seccomp，不靠只覆盖 TCP 的 Landlock 网络规则；
+  - 单独拒绝 ``connect`` / ``sendto`` 等作用在已有 fd 上的调用。没有套接字
+    fd 时它们没有对象；经典 BPF 也看不到 sockaddr 指针。
 
 使用禁忌
 --------
@@ -98,7 +109,7 @@ class ConfinementReport:
         bits = [
             f"沙箱资产不可读={_yn(self.fs_read_denied)}",
             f"全盘不可写={_yn(self.fs_write_denied)}",
-            f"网络不可达={_yn(self.net_denied)}",
+            f"套接字不可建={_yn(self.net_denied)}",
         ]
         out = f"{head} · 机制[{', '.join(self.mechanisms) or '无'}] · " + " ".join(bits)
         if self.gaps:
@@ -297,6 +308,7 @@ _BPF_W = 0x00
 _BPF_ABS = 0x20
 _BPF_JMP = 0x05
 _BPF_JEQ = 0x10
+_BPF_JGE = 0x30
 _BPF_K = 0x00
 _BPF_RET = 0x06
 
@@ -307,9 +319,20 @@ _EPERM = 1
 _AUDIT_ARCH_X86_64 = 0xC000003E
 _AUDIT_ARCH_AARCH64 = 0xC00000B7
 
-# socket() 的调用号。i386 走 socketcall，不在支持范围内，届时直接降级并如实汇报。
-_SYS_SOCKET = {"x86_64": 41, "aarch64": 198}
-_AF_UNIX = 1
+# x32 ABI 把 __X32_SYSCALL_BIT 或进 nr，arch 仍是 AUDIT_ARCH_X86_64。
+# 只比对低位调用号会把这条入口放过去。
+_X32_SYSCALL_BIT = 0x40000000
+
+# socket / socketpair 两架构不同号。io_uring 三调用在 x86_64 与 aarch64 上同号。
+# i386 的 socketcall 不在这两张表里：那个入口的 arch 不是上述任一 ABI，
+# 由「arch 不匹配即拒绝」盖住，不必再列调用号。
+_NR_SOCKET = {"x86_64": 41, "aarch64": 198}
+_NR_SOCKETPAIR = {"x86_64": 53, "aarch64": 199}
+_NR_IO_URING_SETUP = 425
+_NR_IO_URING_ENTER = 426
+_NR_IO_URING_REGISTER = 427
+
+_AUDIT_ARCH = {"x86_64": _AUDIT_ARCH_X86_64, "aarch64": _AUDIT_ARCH_AARCH64}
 
 
 class _SockFilter(ctypes.Structure):
@@ -325,32 +348,96 @@ class _SockFprog(ctypes.Structure):
     _fields_ = [("len", ctypes.c_uint16), ("filter", ctypes.POINTER(_SockFilter))]
 
 
-def _seccomp_block_inet() -> tuple[list[str], list[str]]:
-    """用 seccomp-BPF 拒绝 AF_INET/AF_INET6 的 socket()，放行 AF_UNIX。
+def _seccomp_deny_program(machine: str) -> list[tuple[int, int, int, int]]:
+    """经典 BPF 指令 ``(code, jt, jf, k)``。不安装过滤器，便于在无 seccomp 的平台上解释执行。
 
-    为什么不是直接禁掉整个 socket：Landlock 的网络规则只覆盖 TCP bind/connect，
-    UDP（含 DNS）与 raw socket 不在其内；而完全禁掉 socket 又会连带影响进程内
-    可能用到的 AF_UNIX 通道。按 args[0]（domain）过滤能精确切断外发通道，
-    同时不动本机 IPC。
+    ``jt`` / ``jf`` 是相对**下一条**指令的偏移：落点 = 当前下标 + 1 + 偏移。
+    下面的偏移是按这个规则手算的，真分支都落在最后一条 ``RET EPERM`` 上。
+
+    返回 EPERM 而不是 KILL_PROCESS：两种返回值都不会让内核执行该系统调用。
+    EPERM 把拒绝交回调用方，子进程还活着，管道上的错误回得去；KILL 会把一次
+    被拒绝的调用变成进程死亡，和真正的崩溃分不开。arch 不匹配与 x32 同样
+    走 EPERM——它们不是本 ABI 的合法入口，但系统调用本身仍然不会发生。
     """
-    machine = platform.machine()
-    nr_socket = _SYS_SOCKET.get(machine)
-    arch = {"x86_64": _AUDIT_ARCH_X86_64, "aarch64": _AUDIT_ARCH_AARCH64}.get(machine)
-    if nr_socket is None or arch is None:
-        return [], [f"seccomp 未适配架构 {machine}"]
+    arch = _AUDIT_ARCH.get(machine)
+    nr_socket = _NR_SOCKET.get(machine)
+    nr_pair = _NR_SOCKETPAIR.get(machine)
+    if arch is None or nr_socket is None or nr_pair is None:
+        return []
 
-    # seccomp_data 布局：nr@0, arch@4, ip@8, args[0]@16
-    prog = [
-        (_BPF_LD | _BPF_W | _BPF_ABS, 0, 0, 4),            # 0: A = arch
-        (_BPF_JMP | _BPF_JEQ | _BPF_K, 0, 2, arch),        # 1: arch 不符 → 放行（不误伤）
-        (_BPF_LD | _BPF_W | _BPF_ABS, 0, 0, 0),            # 2: A = nr
-        (_BPF_JMP | _BPF_JEQ | _BPF_K, 1, 0, nr_socket),   # 3: 是 socket 则查 domain
-        (_BPF_RET | _BPF_K, 0, 0, _SECCOMP_RET_ALLOW),     # 4: 其余一律放行
-        (_BPF_LD | _BPF_W | _BPF_ABS, 0, 0, 16),           # 5: A = args[0] = domain
-        (_BPF_JMP | _BPF_JEQ | _BPF_K, 1, 0, _AF_UNIX),    # 6: AF_UNIX 放行
-        (_BPF_RET | _BPF_K, 0, 0, _SECCOMP_RET_ERRNO | _EPERM),  # 7: 其余 domain → EPERM
-        (_BPF_RET | _BPF_K, 0, 0, _SECCOMP_RET_ALLOW),     # 8: AF_UNIX 落点
+    ld = _BPF_LD | _BPF_W | _BPF_ABS
+    jeq = _BPF_JMP | _BPF_JEQ | _BPF_K
+    jge = _BPF_JMP | _BPF_JGE | _BPF_K
+    ret = _BPF_RET | _BPF_K
+    allow = _SECCOMP_RET_ALLOW
+    deny = _SECCOMP_RET_ERRNO | _EPERM
+
+    # seccomp_data：nr@0，arch@4。args[0] 在 @16，本过滤器不看 domain。
+    if machine == "x86_64":
+        # 0 LD arch
+        # 1 JEQ：相等→2，不等→1+1+8=10
+        # 2 LD nr
+        # 3 JGE x32：成立→3+1+6=10，否则→4
+        # 4 JEQ socket：成立→4+1+5=10，否则→5
+        # 5 JEQ socketpair：成立→5+1+4=10，否则→6
+        # 6 JEQ io_uring_setup：成立→6+1+3=10，否则→7
+        # 7 JEQ io_uring_enter：成立→7+1+2=10，否则→8
+        # 8 JEQ io_uring_register：成立→8+1+1=10，否则→9
+        # 9 RET ALLOW
+        # 10 RET EPERM
+        return [
+            (ld, 0, 0, 4),
+            (jeq, 0, 8, arch),
+            (ld, 0, 0, 0),
+            (jge, 6, 0, _X32_SYSCALL_BIT),
+            (jeq, 5, 0, nr_socket),
+            (jeq, 4, 0, nr_pair),
+            (jeq, 3, 0, _NR_IO_URING_SETUP),
+            (jeq, 2, 0, _NR_IO_URING_ENTER),
+            (jeq, 1, 0, _NR_IO_URING_REGISTER),
+            (ret, 0, 0, allow),
+            (ret, 0, 0, deny),
+        ]
+
+    # aarch64 没有 x32 那一位。0..9，拒绝落点是 9。
+    # 1 JEQ：不等→1+1+7=9
+    # 3 JEQ socket：成立→3+1+5=9
+    # 4 JEQ socketpair：成立→4+1+4=9
+    # 5 JEQ setup：成立→5+1+3=9
+    # 6 JEQ enter：成立→6+1+2=9
+    # 7 JEQ register：成立→7+1+1=9
+    return [
+        (ld, 0, 0, 4),
+        (jeq, 0, 7, arch),
+        (ld, 0, 0, 0),
+        (jeq, 5, 0, nr_socket),
+        (jeq, 4, 0, nr_pair),
+        (jeq, 3, 0, _NR_IO_URING_SETUP),
+        (jeq, 2, 0, _NR_IO_URING_ENTER),
+        (jeq, 1, 0, _NR_IO_URING_REGISTER),
+        (ret, 0, 0, allow),
+        (ret, 0, 0, deny),
     ]
+
+
+def _seccomp_deny_sockets() -> tuple[list[str], list[str]]:
+    """拒绝新建任何套接字，并拒绝 io_uring 三条入口。
+
+    剥权之后子进程唯一的出口是父进程事先建好的匿名管道（见
+    ``AttachedBrokerClient``）。``MockLLM`` 与经管道代办的模型调用都不创建
+    套接字，因此不必为 AF_UNIX 留口。
+
+    ``socketpair`` 一并拒绝：它连不上按路径的 Unix socket，却是另一条造出
+    socket fd 的系统调用。留下它，「开不出套接字」就不成立。
+
+    路径型 AF_UNIX（用户 D-Bus、docker.sock、ssh-agent）的 ``connect``
+    Landlock 管不到；拒绝 ``socket`` 本身之后，这条路没有 fd 可用。
+    ``io_uring`` 的 IORING_OP_SOCKET 不经过 ``socket``，所以三条 io_uring
+    调用一起拒绝，而不是只拒绝 setup。
+    """
+    prog = _seccomp_deny_program(platform.machine())
+    if not prog:
+        return [], [f"seccomp 未适配架构 {platform.machine()}"]
 
     arr = (_SockFilter * len(prog))(*[_SockFilter(*ins) for ins in prog])
     fprog = _SockFprog(len(prog), arr)
@@ -361,7 +448,7 @@ def _seccomp_block_inet() -> tuple[list[str], list[str]]:
     ctypes.set_errno(0)
     if libc.prctl(_PR_SET_SECCOMP, _SECCOMP_MODE_FILTER, ctypes.byref(fprog), 0, 0) != 0:
         return [], [f"PR_SET_SECCOMP 失败 errno={ctypes.get_errno()}"]
-    return ["seccomp-bpf(no-AF_INET)"], []
+    return ["seccomp-bpf(no-socket,no-io_uring)"], []
 
 
 # ---------------------------------------------------------------- Windows
@@ -485,7 +572,7 @@ def probe() -> dict[str, object]:
         "platform": sys.platform,
         "machine": platform.machine(),
         "landlock_abi": landlock_abi(),
-        "seccomp_arch_supported": platform.machine() in _SYS_SOCKET,
+        "seccomp_arch_supported": platform.machine() in _NR_SOCKET,
         "max_level": "S2" if (sys.platform == "linux" and landlock_abi() > 0) else "S1",
     }
 
@@ -522,17 +609,24 @@ def apply_confinement(
         reads = read_paths if read_paths is not None else default_read_paths()
         writes = write_paths or []
         ll_mech, ll_err = _apply_landlock(reads, writes, block_net=True)
-        sc_mech, sc_err = _seccomp_block_inet()
+        sc_mech, sc_err = _seccomp_deny_sockets()
         mech += ll_mech + sc_mech
         errors += ll_err + sc_err
         fs_ok = bool(ll_mech)
-        net_ok = bool(sc_mech) or "landlock-net-tcp" in ll_mech
+        # Landlock 的网络规则只覆盖 TCP。只装上它不能把 net_denied 标成真，
+        # 否则 UDP 与 Unix socket 会被报成已经切断。
+        net_ok = bool(sc_mech)
         if not fs_ok:
             gaps.append("Landlock 未生效，文件系统限制退化为 S1")
         if not net_ok:
-            gaps.append("seccomp 未生效，网络限制退化为 S1")
+            gaps.append("seccomp 未生效，套接字限制退化为 S1")
         if fs_ok:
             gaps.append("系统目录（/usr、/etc 等）仍可读：运行 Python 所必需，不在资产集合内")
+        if net_ok:
+            gaps.append("seccomp 不撤销施加前已打开的 fd；父进程只把管道交给子进程")
+            gaps.append(
+                "Landlock 网络规则只覆盖 TCP bind/connect；UDP 与路径型 Unix socket 靠拒绝 socket 创建"
+            )
         effective = "S2" if (fs_ok or net_ok) else "S1"
         return ConfinementReport(
             requested="S2", effective=effective, mechanisms=tuple(mech),
