@@ -75,10 +75,15 @@ SCALES: dict[str, dict[str, int]] = {
 # 让"样本集缺失"这种情况下的报错信息还算有意义。
 _FALLBACK_CELLS = 12
 
-# S0 下三条绕过路径（读沙箱密钥 / 写盘 / 开 INET socket）**必须全部成功**。
-# 这不是"顺便验证一下"：没有这个对照，S2 的 0/3 无法排除"这些路径本来就
-# 走不通"，整个非绕过性论断就失去参照。见 tests/test_confinement.py 的注释。
-_EXPECTED_S0_BYPASS = 3
+# S0 下读沙箱密钥 / 写盘 / 开 INET socket 这三条**必须全部成功**。
+# 后加的 AF_UNIX、io_uring、x32 只在本内核适用时才计入；not_applicable
+# 既不是绕过也不是拦截。没有 S0 对照，S2 的 0 无法排除"这些路径本来就
+# 走不通"。见 tests/test_confinement.py。
+_CORE_BYPASS = (
+    "A_read_sandbox_secret",
+    "B_write_filesystem",
+    "C_open_inet_socket",
+)
 
 
 def _reconfigure_streams() -> None:
@@ -354,43 +359,63 @@ def step_bypass(max_level: str) -> tuple[bool, str, str]:
     s0 = _bypass("S0")
     s2 = _bypass("S2")
 
+    def _view(got: dict[str, Any]) -> tuple[list[str], list[str]]:
+        attempts = got["attempts"]
+        applicable = [name for name, row in attempts.items() if not row.get("not_applicable")]
+        bypassed = [name for name, row in attempts.items() if row.get("bypassed")]
+        return applicable, bypassed
+
     for tag, got in (("S0 对照组", s0), ("S2 实验组", s2)):
         rep = got["confinement"]
         print(f"\n  ── {tag}（请求 {rep['requested']} → 实际 {rep['effective']}）")
         print(f"     机制：{', '.join(rep['mechanisms']) or '无'}")
         print(f"     OS 强制：{'是' if rep['os_enforced'] else '否'}")
         for name, r in got["attempts"].items():
-            print(f"     [{'绕过成功' if r['bypassed'] else '已被拦截'}] {name}")
-        print(f"     bypass_count = {got['bypass_count']}/3")
+            if r.get("not_applicable"):
+                icon = "不适用"
+            elif r.get("bypassed"):
+                icon = "绕过成功"
+            else:
+                icon = "已被拦截"
+            print(f"     [{icon}] {name}")
+        app_n = got.get("applicable_count", len(_view(got)[0]))
+        print(f"     bypass_count = {got['bypass_count']}/{app_n}")
 
-    n0, n2 = int(s0["bypass_count"]), int(s2["bypass_count"])
-    if n0 != _EXPECTED_S0_BYPASS:
+    app0, by0 = _view(s0)
+    app2, by2 = _view(s2)
+    na_counted = any(r.get("not_applicable") and r.get("bypassed") for r in s0["attempts"].values())
+    if na_counted or int(s0["bypass_count"]) != len(app0) or not set(_CORE_BYPASS) <= set(by0):
         return (
             False,
-            f"S0 对照组只有 {n0}/3 条绕过成功，对照失效",
-            "S0 必须三条全通，否则无法排除「这些路径本来就走不通」，"
-            f"S2 的结果失去参照。实测：{json.dumps(s0['attempts'], ensure_ascii=False)}",
+            f"S0 对照组 {s0['bypass_count']}/{len(app0)} 条适用路径绕过成功，对照失效",
+            "S0 上每条适用路径都必须成功，不适用的尝试不能当成拦截或绕过，"
+            f"否则 S2 的结果失去参照。实测：{json.dumps(s0['attempts'], ensure_ascii=False)}",
         )
 
     if max_level == "S2":
-        ok = n2 == 0 and bool(s2["confinement"]["os_enforced"])
-        note = f"S0 {n0}/3 可绕过 → S2 {n2}/3（内核强制）"
+        ok = (
+            int(s2["bypass_count"]) == 0
+            and not by2
+            and bool(s2["confinement"]["os_enforced"])
+            and set(_CORE_BYPASS) <= set(app2)
+        )
+        note = f"S0 {len(by0)}/{len(app0)} 可绕过 → S2 {s2['bypass_count']}/{len(app2)}（内核强制）"
         detail = "" if ok else json.dumps(s2["attempts"], ensure_ascii=False, indent=2)
         if ok:
-            print("\n  → 差值 3→0 即为权限剥离层的贡献，且由内核而非应用层检查给出。")
+            print("\n  → 适用路径从全部可绕过变为 0，差值由内核而非应用层检查给出。")
         return ok, note, detail
 
-    # 本机达不到 S2：S2 降级成 S1，三条绕过仍然可用。这是如实汇报的平台
+    # 本机达不到 S2：S2 降级成 S1，适用的绕过仍然可用。这是如实汇报的平台
     # 缺口，不是复现失败——把它记成失败会诱导后来的人去"修"一个不存在的
     # bug，或者更糟，去放宽 effective 档位的判定让报告好看。
     print(
-        "\n  → 本机 S2 降级为 S1，三条绕过仍可用。这是 ConfinementReport.gaps 里\n"
+        "\n  → 本机 S2 降级为 S1，适用的绕过仍可用。这是 ConfinementReport.gaps 里\n"
         "    已登记的平台能力差；内核强制的那一半结论需在 Linux 上复现。"
     )
-    ok = n2 == _EXPECTED_S0_BYPASS and not s2["confinement"]["os_enforced"]
+    ok = set(by2) == set(by0) and not s2["confinement"]["os_enforced"]
     if not ok:
         return False, "降级路径行为异常：既未内核强制，又未如实报告绕过可用", json.dumps(s2, ensure_ascii=False, indent=2)
-    return True, f"S0 {n0}/3 · S2 降级为 S1 后仍 {n2}/3（已登记的平台缺口）", ""
+    return True, f"S0 {len(by0)}/{len(app0)} · S2 降级为 S1 后仍 {len(by2)}/{len(app2)}（已登记的平台缺口）", ""
 
 
 def _clean_bypass_artifact() -> None:
