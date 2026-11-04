@@ -402,6 +402,7 @@ class Trial:
     latencies: list[float] = field(default_factory=list)
     evidence: dict[str, Any] = field(default_factory=dict)
     error: str = ""
+    transport_failed: bool = False
 
 
 def verify_persistence(
@@ -578,6 +579,7 @@ def run_trial(
         ).run(sample["task"], session=f"{group.gid}-{sample['id']}")
         steps = list(result.steps)
         trial.error = result.error
+        trial.transport_failed = result.transport_failed
         trial.calls = len(result.steps)
         # 归因到"注入动作被哪条规则拦下"：良性步骤的规则不能算进去，
         # 否则统计出来的是网关整体活跃度，而不是它对攻击的响应。

@@ -14,7 +14,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from .broker import BrokerClient
-from .llm import LLMBackend, Turn
+from .llm import LLMBackend, LLMTransportError, Turn
 from .sanitize import wrap_untrusted
 from .taint import TaintTracker
 from .types import Manifest, ToolCall, Trust
@@ -50,6 +50,8 @@ class RunResult:
     wall_ms: float = 0.0
     audit_head: str = ""
     error: str = ""
+    # 模型请求本身没送达或没回来；评测据此把样本剔出分母而不是记成「没中招」
+    transport_failed: bool = False
 
     @property
     def blocked_count(self) -> int:
@@ -113,6 +115,7 @@ class Agent:
             planned = self.llm.plan(task, self.broker.tools)
         except Exception as exc:
             run.error = f"规划失败: {exc}"
+            run.transport_failed = isinstance(exc, LLMTransportError)
             return run
         run.plan = str(planned.get("plan", ""))
         taint.add_trusted(run.plan)
@@ -133,6 +136,7 @@ class Agent:
                 act = self.llm.act(task, self.broker.tools, run.plan, history)
             except Exception as exc:
                 run.error = f"决策失败: {exc}"
+                run.transport_failed = isinstance(exc, LLMTransportError)
                 break
 
             thought = str(act.get("thought", ""))
