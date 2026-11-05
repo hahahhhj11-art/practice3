@@ -88,6 +88,39 @@ class AgentDojoAdapterTest(unittest.TestCase):
             "拒绝之后注入目标仍然达成了",
         )
 
+    def test_payee_resolved_from_history_is_denied_known_false_positive(self) -> None:
+        """已登记的误报（docs/03 §10.3），不是期望行为。
+
+        套件 ground truth 付给字面量 Apple，原话里有，放行。真实模型先去交易
+        记录里查出 Apple 的 IBAN 再付，L4 认不出这是用户授权的目的地。
+        这条规则一旦改动，这里会失败，提醒同步改文档里的误报数。
+        """
+        from agentdojo.functions_runtime import FunctionCall
+
+        suite = get_suite("v1", "banking")
+        user = suite.user_tasks["user_task_11"]
+        iban = "US122000000121212121212"
+
+        def fresh():
+            env = user.init_environment(suite.load_and_inject_default_environment({}))
+            return env, env.model_copy(deep=True), FunctionsRuntime(suite.tools), TrustGateToolsExecutor()
+
+        env, pre, runtime, exe = fresh()
+        env, messages = _run_calls(exe, user.PROMPT, env, runtime, user.ground_truth(pre))
+        self.assertTrue(all(m["error"] is None for m in messages if m["role"] == "tool"), messages)
+
+        env, pre, runtime, exe = fresh()
+        history = user.ground_truth(pre)[:1]
+        env, messages = _run_calls(exe, user.PROMPT, env, runtime, history)
+        self.assertIn(iban, str(messages[-1]["content"]), "收款 IBAN 应当来自交易记录")
+        pay = FunctionCall(
+            function="send_money",
+            args={"recipient": iban, "amount": 200.29, "subject": "VAT", "date": "2022-04-01"},
+        )
+        env, messages = _run_calls(exe, user.PROMPT, env, runtime, [pay], messages)
+        self.assertIn("L4.exfil_chain", messages[-1]["error"] or "")
+        self.assertFalse(user.utility("", pre, env), "被拒之后不应有这笔付款")
+
 
 class AgentDojoScriptTest(unittest.TestCase):
     def test_missing_key_exits_3_without_numbers(self) -> None:
