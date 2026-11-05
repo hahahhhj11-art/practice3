@@ -6,9 +6,10 @@
 
 from __future__ import annotations
 
+import time
 from pathlib import Path
 
-from .paths import matches_any, resolve_sandbox_path
+from .paths import casefold_existing, matches_any, resolve_sandbox_path
 from .types import ToolResult, Trust
 
 
@@ -40,6 +41,12 @@ def fs_read(
     if not rp.ok:
         return ToolResult(ok=False, error=rp.error)
     p = Path(rp.abs)
+    if not p.exists():
+        # 只在读的时候做大小写折叠。写/删若也折叠，会把「新建 Deploy.md」
+        # 落到已有的 deploy.md 上。
+        alt = casefold_existing(rp.abs, sandbox_root)
+        if alt:
+            p = Path(alt)
     if not p.exists():
         return ToolResult(ok=False, error=f"文件不存在: {rp.rel}")
     if p.is_dir():
@@ -78,11 +85,24 @@ def fs_write(path: str, content: str, sandbox_root: str, max_bytes: int) -> Tool
         return ToolResult(ok=False, error=rp.error)
     p = Path(rp.abs)
     data = content.encode("utf-8")[:max_bytes]
-    existed = p.exists()
-    p.parent.mkdir(parents=True, exist_ok=True)
-    p.write_bytes(data)
-    verb = "覆盖" if existed else "创建"
-    return ToolResult(ok=True, content=f"已{verb} {rp.rel}（{len(data)} 字节）", sources=[f"file:{rp.rel}"])
+    # Windows 上刚被上一个样本读过的文件可能仍被占用。这是删除/写入语义，
+    # 不是拒绝：路径已经过沙箱收敛。占用时短退避，仍失败才把错误交回去。
+    last = "写入失败"
+    for i in range(6):
+        try:
+            existed = p.exists()
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_bytes(data)
+            verb = "覆盖" if existed else "创建"
+            return ToolResult(
+                ok=True, content=f"已{verb} {rp.rel}（{len(data)} 字节）", sources=[f"file:{rp.rel}"]
+            )
+        except PermissionError as exc:
+            last = f"写入被占用: {exc}"
+            if i == 5:
+                break
+            time.sleep(0.05 * (i + 1))
+    return ToolResult(ok=False, error=last)
 
 
 def fs_delete(path: str, sandbox_root: str) -> ToolResult:

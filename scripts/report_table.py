@@ -2,7 +2,8 @@
 
 存在的理由很实际：主表与分格表要同时出现在 README、docs/03 和论文里，手抄三遍
 必然抄错一处，而抄错的那个数字看不出来是抄错的。既然报告 JSON 是唯一事实来源，
-表格就应该由它生成。
+表格就应该由它生成。文末的「可粘贴摘要」把同一批数字收成一段，文档只许从这里
+抄，不许从记忆里补。
 
     python scripts/report_table.py logs/eval-main.json
 """
@@ -15,6 +16,10 @@ import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from eval.stats import format_rate  # noqa: E402
 
 GROUP_NAMES = {
     "C0": "无防护基线",
@@ -31,46 +36,113 @@ CELL_NAMES = {
 EVASION_NAMES = {
     "naive": "朴素", "policy_aware": "合规内", "lowbw": "低带宽", "path_lowbw": "路径低带宽",
     "prefix_widen": "前缀放宽", "basename_launder": "同名洗白", "subthreshold": "阈下分片",
+    "case_variant": "大小写", "dot_slash": "点斜杠", "dotdot": "点点",
+    "dup_slash": "重复斜杠", "backslash": "反斜杠", "pct_path": "百分号路径",
+    "split_join": "分段拼接", "b64": "base64", "hex": "十六进制",
+    "reversed": "倒序", "separated": "分隔符", "pct": "百分号数据",
 }
+# 自适应格在分格表上标 †。名字集中在这里，是为了让 README 与 docs 用的是
+# 同一份标记，而不是各写各的。
+ADAPTIVE = {
+    "prefix_widen", "basename_launder", "subthreshold",
+    "case_variant", "dot_slash", "dotdot", "dup_slash", "backslash",
+    "pct_path", "split_join", "b64", "hex", "reversed", "separated", "pct",
+}
+TARGET_ORDER = ("read", "delete", "overwrite", "exfil", "persist")
+EVASION_ORDER = (
+    "naive", "policy_aware", "prefix_widen", "case_variant", "dot_slash", "dotdot",
+    "dup_slash", "backslash", "pct_path", "split_join",
+    "lowbw", "path_lowbw", "basename_launder", "subthreshold",
+    "b64", "hex", "reversed", "separated", "pct",
+)
 
 
-def cell_label(cell: str) -> str:
+def cell_label(cell: str, dagger: bool = True) -> str:
     tgt, _, ev = cell.partition("/")
-    return f"{CELL_NAMES.get(tgt, tgt)}/{EVASION_NAMES.get(ev, ev)}"
+    label = f"{CELL_NAMES.get(tgt, tgt)}/{EVASION_NAMES.get(ev, ev)}"
+    if dagger and ev in ADAPTIVE:
+        label += "†"
+    return label
 
 
-def main() -> int:
-    for s in (sys.stdout, sys.stderr):
-        if hasattr(s, "reconfigure"):
-            s.reconfigure(encoding="utf-8", errors="replace")
+def _cell_key(cell: str) -> tuple[int, int, str]:
+    tgt, _, ev = cell.partition("/")
+    ti = TARGET_ORDER.index(tgt) if tgt in TARGET_ORDER else len(TARGET_ORDER)
+    ei = EVASION_ORDER.index(ev) if ev in EVASION_ORDER else len(EVASION_ORDER)
+    return (ti, ei, cell)
 
-    ap = argparse.ArgumentParser()
-    ap.add_argument("report", nargs="?", default="logs/eval-main.json")
-    ns = ap.parse_args()
 
-    path = ROOT / ns.report
-    report = json.loads(path.read_text(encoding="utf-8"))
+def corpus_blurb() -> str:
+    """语料库规模只从 index.json 数，不写死。生成器增删变体时这里跟着变。"""
+    index = ROOT / "attacks" / "samples" / "index.json"
+    if not index.exists():
+        return "未找到 attacks/samples/index.json（先运行 python attacks/generate.py --clean）。"
+    records = json.loads(index.read_text(encoding="utf-8"))
+    cells: dict[str, int] = {}
+    for r in records:
+        key = f"{r['target']}/{r['evasion']}"
+        cells[key] = cells.get(key, 0) + 1
+    per = sorted(set(cells.values()))
+    per_s = str(per[0]) if len(per) == 1 else "、".join(str(n) for n in per)
+    return f"语料库 {len(records)} 条、{len(cells)} 格（每格 {per_s} 条）。"
+
+
+def render(report: dict, source: str) -> str:
     groups = report["groups"]
     trials = report["trials"]
     meta = report["meta"]
-
-    print(f"来源 {ns.report} · 攻击样本 {meta['n_attack_samples']} 条 "
-          f"· 良性任务 {meta['n_benign_samples']} 条 · {meta['llm']}\n")
-
-    print("## 主表\n")
-    print("| 组 | 防御配置 | ASR | UA | BTC | 良性 FPR | 判定命中率 | 实际阻断率 | P50 | P95 |")
-    print("| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |")
+    cells = sorted(
+        {f"{t['target']}/{t['evasion']}" for t in trials if t["target"] != "benign"},
+        key=_cell_key,
+    )
+    lines = [
+        f"来源 `{source}` · 本报告攻击样本 {meta['n_attack_samples']} 条 "
+        f"· 良性任务 {meta['n_benign_samples']} 条 · {meta['llm']}",
+        corpus_blurb(),
+        "",
+        "## 主表",
+        "",
+        "| 组 | 防御配置 | ASR | UA | BTC | 良性 FPR | 良性确认率 | 判定命中率 | 实际阻断率 | P50 | P95 |",
+        "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |",
+    ]
     for gid, m in groups.items():
-        print(
+        lines.append(
             f"| {gid} | {GROUP_NAMES.get(gid, gid)} | {m['ASR']}% | {m['UA']}% | {m['BTC']}% "
-            f"| {m['FPR_benign_calls']}% | {m.get('flag_rate_calls', 0)}% | {m['BR_calls']}% "
-            f"| {m['latency_p50_ms']}ms | {m['latency_p95_ms']}ms |"
+            f"| {m['FPR_benign_calls']}% | {m.get('confirm_rate_benign', 0)}% "
+            f"| {m.get('flag_rate_calls', 0)}% | {m['BR_calls']}% "
+            f"| {m['latency_p50_ms']:.3f}ms | {m['latency_p95_ms']:.3f}ms |"
         )
 
-    cells = sorted({f"{t['target']}/{t['evasion']}" for t in trials if t["target"] != "benign"})
-    print("\n## 分格 ASR（%）\n")
-    print("| 组 | " + " | ".join(cell_label(c) for c in cells) + " |")
-    print("| --- |" + " --- |" * len(cells))
+    lines += ["", "## Wilson 95% 区间", ""]
+    lines.append("BTC 的 n 是良性任务条数；FPR 与确认率的 n 是良性调用次数。")
+    lines.append("ASR 与 UA 的 n 是本报告里的攻击样本条数，不是语料库里同格的 96 条。")
+    lines.append(
+        "ASR@obedient 的区间只描述这一次抽样的二项计数。同格样本的 sim_actions 相同，"
+        "MockLLM 不读注入文本，把 96 条算进 n 不会多出信息，也不等于模型统计显著性。"
+    )
+    lines.append("换一个模型之后的方差不在这些区间里。")
+    lines.append("")
+    lines.append("| 组 | ASR | UA | BTC | 良性 FPR | 良性确认率 |")
+    lines.append("| --- | --- | --- | --- | --- | --- |")
+    for gid in groups:
+        ben = [t for t in trials if t.get("group") == gid and t.get("target") == "benign"]
+        atk = [t for t in trials if t.get("group") == gid and t.get("target") != "benign"]
+        calls = sum(int(t.get("calls") or 0) for t in ben)
+        lines.append(
+            f"| {gid} | {format_rate(sum(1 for t in atk if t.get('attack_success')), len(atk))} "
+            f"| {format_rate(sum(1 for t in atk if t.get('task_completed')), len(atk))} "
+            f"| {format_rate(sum(1 for t in ben if t.get('task_completed')), len(ben))} "
+            f"| {format_rate(sum(int(t.get('blocked') or 0) for t in ben), calls)} "
+            f"| {format_rate(sum(int(t.get('confirms') or 0) for t in ben), calls)} |"
+        )
+
+    lines += [
+        "",
+        "## 分格 ASR（%）",
+        "",
+        "| 组 | " + " | ".join(cell_label(c) for c in cells) + " |",
+        "| --- |" + " --- |" * len(cells),
+    ]
     for gid in groups:
         row = []
         for c in cells:
@@ -83,11 +155,17 @@ def main() -> int:
                 continue
             asr = round(100 * sum(1 for t in sub if t["attack_success"]) / len(sub))
             row.append(f"**{asr}**" if asr else "0")
-        print(f"| {gid} | " + " | ".join(row) + " |")
+        lines.append(f"| {gid} | " + " | ".join(row) + " |")
 
-    print("\n## 各格预期拦截层 vs 实测（C5）\n")
-    print("| 格 | 预期层 | 实测规则 |")
-    print("| --- | --- | --- |")
+    lines += [
+        "",
+        "## 各格预期拦截层 vs 实测（C5）",
+        "",
+        "| 格 | 预期层 | 实测规则 |",
+        "| --- | --- | --- |",
+    ]
+    n_ok = 0
+    n_bad = 0
     for c in cells:
         sub = [
             t for t in trials
@@ -97,8 +175,82 @@ def main() -> int:
             continue
         expect = sub[0]["expect_layer"]
         rules = sorted({t["blocking_rule"] for t in sub if t["blocking_rule"]})
-        ok = "✔" if all(r.startswith(expect) for r in rules) and rules else "✗"
-        print(f"| {cell_label(c)} | {expect} | {', '.join(f'`{r}`' for r in rules) or '（无）'} {ok} |")
+        ok = bool(rules) and all(str(r).startswith(expect) for r in rules)
+        if ok:
+            n_ok += 1
+        else:
+            n_bad += 1
+        mark = "✔" if ok else "✗"
+        lines.append(
+            f"| {cell_label(c)} | {expect} | "
+            f"{', '.join(f'`{r}`' for r in rules) or '（无）'} {mark} |"
+        )
+
+    c0 = groups.get("C0", {})
+    c5 = groups.get("C5", {})
+
+    def _atk(gid: str) -> list[dict]:
+        return [t for t in trials if t.get("group") == gid and t.get("target") != "benign"]
+
+    def _ben(gid: str) -> list[dict]:
+        return [t for t in trials if t.get("group") == gid and t.get("target") == "benign"]
+
+    c5_atk = _atk("C5")
+    c5_ben = _ben("C5")
+    c5_calls = sum(int(t.get("calls") or 0) for t in c5_ben)
+    lines += [
+        "",
+        "## 可粘贴摘要",
+        "",
+        corpus_blurb() + (
+            f"本报告抽样 {meta['n_attack_samples']} 条攻击 + "
+            f"{meta['n_benign_samples']} 条良性，后端 {meta['llm']}。"
+        ),
+        (
+            f"C0 ASR {c0.get('ASR', '—')}%、UA {c0.get('UA', '—')}%、"
+            f"BTC {c0.get('BTC', '—')}%、良性 FPR {c0.get('FPR_benign_calls', '—')}%、"
+            f"良性确认率 {c0.get('confirm_rate_benign', '—')}%、"
+            f"判定命中率 {c0.get('flag_rate_calls', '—')}%、"
+            f"实际阻断率 {c0.get('BR_calls', '—')}%、"
+            f"P50 {c0.get('latency_p50_ms', 0):.3f}ms、P95 {c0.get('latency_p95_ms', 0):.3f}ms。"
+        ),
+        (
+            f"C5 ASR {c5.get('ASR', '—')}%、UA {c5.get('UA', '—')}%、"
+            f"BTC {c5.get('BTC', '—')}%、良性 FPR {c5.get('FPR_benign_calls', '—')}%、"
+            f"良性确认率 {c5.get('confirm_rate_benign', '—')}%、"
+            f"判定命中率 {c5.get('flag_rate_calls', '—')}%、"
+            f"实际阻断率 {c5.get('BR_calls', '—')}%、"
+            f"P50 {c5.get('latency_p50_ms', 0):.3f}ms、P95 {c5.get('latency_p95_ms', 0):.3f}ms。"
+        ),
+        f"C5 预期层对账：{n_ok} 格一致，{n_bad} 格偏离。",
+        (
+            "C5 区间："
+            f"ASR {format_rate(sum(1 for t in c5_atk if t.get('attack_success')), len(c5_atk))}；"
+            f"UA {format_rate(sum(1 for t in c5_atk if t.get('task_completed')), len(c5_atk))}；"
+            f"BTC {format_rate(sum(1 for t in c5_ben if t.get('task_completed')), len(c5_ben))}；"
+            f"FPR {format_rate(sum(int(t.get('blocked') or 0) for t in c5_ben), c5_calls)}；"
+            f"确认率 {format_rate(sum(int(t.get('confirms') or 0) for t in c5_ben), c5_calls)}。"
+        ),
+        "ASR 与 UA 的 n 是本报告攻击样本条数，不是同格 96 条。ASR@obedient 的区间是样本数口径，不是模型统计显著性。",
+        "以上数字全部来自本报告 JSON，不要手改。",
+    ]
+    return "\n".join(lines)
+
+
+def main() -> int:
+    for s in (sys.stdout, sys.stderr):
+        if hasattr(s, "reconfigure"):
+            s.reconfigure(encoding="utf-8", errors="replace")
+
+    ap = argparse.ArgumentParser()
+    ap.add_argument("report", nargs="?", default="logs/eval-main.json")
+    ns = ap.parse_args()
+
+    path = Path(ns.report)
+    if not path.is_absolute():
+        path = ROOT / path
+    report = json.loads(path.read_text(encoding="utf-8"))
+    print(render(report, ns.report))
     return 0
 
 

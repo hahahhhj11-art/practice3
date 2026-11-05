@@ -20,6 +20,12 @@ Agent 进程内，绕过路径由 Landlock/seccomp 在内核层切断。
    证据。父进程从 ``/proc/<pid>/status`` 读内核直接暴露的 Seccomp 状态做独立
    核验；Landlock 内核不提供 /proc 内省，这一项如实标为不可内省，改由
    scripts/bypass_demo.py 用「父进程亲自检查文件系统有没有被动过」来取证。
+3. **会话控制消息不采信子进程。** 内核剥权只切断了「绕开管道」，管道本身
+   仍是攻击面：``session_start`` 里的 task 是污点溯源的可信根，而会话状态
+   （污染标记、外发预算、能力清单）都挂在 session 上。若子进程能自报 task、
+   能中途重发 ``session_start``，被注入的 Agent 就能把外泄 URL 写进「用户
+   任务」、清零污染状态、重新冻结清单，不碰任何系统调用就让 L1–L5 放行。
+   因此 session 与 task 由本进程决定，会话控制消息每种只受理一次。
 """
 
 from __future__ import annotations
@@ -30,11 +36,14 @@ import os
 import subprocess
 import sys
 import time
+import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from .audit import digest_args
 from .broker import Broker
+from .confine import probe
 from .llm import LLMBackend, Turn
 from .paths import project_root
 
@@ -60,6 +69,12 @@ class SupervisedRun:
     llm_calls: int = 0
     wall_ms: float = 0.0
     error: str = ""
+    child_pid: int = 0
+    # 已受理过的一次性会话控制消息；重复出现即视为协议违规
+    seen: set[str] = field(default_factory=set)
+    protocol_violations: list[str] = field(default_factory=list)
+    # 请求 S2 且本平台做得到、但核验没站住。非空则拒绝之后的工具调用与模型代办。
+    confine_failed: str = ""
 
     @property
     def steps(self) -> list[dict[str, Any]]:
@@ -110,6 +125,19 @@ class SupervisedRun:
         if c.get("gaps"):
             bits.append("未覆盖：" + "；".join(c["gaps"]))
         return "权限剥离：" + " | ".join(bits)
+
+
+def _llm_request_digest(msg: dict[str, Any]) -> str:
+    """代办请求的摘要。只覆盖真正送进模型的字段，日志里不留原文。"""
+    return digest_args(
+        {
+            "op": str(msg.get("op", "")),
+            "task": msg.get("task", ""),
+            "tools": msg.get("tools", []),
+            "plan": msg.get("plan", ""),
+            "history": msg.get("history", []),
+        }
+    )
 
 
 def verify_child_confinement(pid: int) -> dict[str, Any]:
@@ -167,29 +195,115 @@ class Supervisor:
 
     # ---- 消息分发：不认识的一律交给 Broker 走完整仲裁 ----
 
+    _ONCE = ("child_hello", "session_start", "freeze_manifest", "session_end", "run_result", "run_failed")
+    _PASSTHROUGH = ("tool_call", "attest", "checkpoint")
+
+    def _reject(self, run: SupervisedRun, why: str) -> dict[str, Any]:
+        run.protocol_violations.append(why)
+        self.broker.audit.append("protocol_violation", self.broker.policy_hash,
+                                 session=run.session, reason=why)
+        return {"type": "error", "error": f"[TrustGate 协议] {why}"}
+
+    def _s2_os_required(self) -> bool:
+        """请求了 S2，且本平台的 probe 认为内核强制做得到。
+
+        做不到时（Windows 的 max_level 是 S1）保持如实降级并继续，不在这里失败关闭。
+        """
+        return self.confine.upper() == "S2" and str(probe().get("max_level")) == "S2"
+
+    def _mark_confine_failure(self, run: SupervisedRun, why: str) -> None:
+        run.confine_failed = run.confine_failed or why
+        run.error = run.error or run.confine_failed
+
+    def _assess_confinement(self, run: SupervisedRun) -> None:
+        if not self._s2_os_required():
+            return
+        # seen 在进入处理函数前已经写入。hello 晚于 session_start 到达时，洗不掉这个失败。
+        if "session_start" in run.seen:
+            self._mark_confine_failure(run, "child_hello 未在 session_start 之前到达")
+            return
+        claimed = run.confinement_claimed
+        problems: list[str] = []
+        if not claimed.get("fs_read_denied") or not claimed.get("net_denied"):
+            problems.append("子进程自报 fs_read_denied/net_denied 不成立")
+        try:
+            mode = int(run.confinement_verified.get("seccomp_mode"))
+        except (TypeError, ValueError):
+            mode = -1
+        if mode != 2:
+            problems.append(f"父进程核验 seccomp_mode={mode}，要求 2")
+        if problems:
+            self._mark_confine_failure(run, "；".join(problems))
+
+    def _confine_block(self, run: SupervisedRun) -> str:
+        if not self._s2_os_required():
+            return ""
+        if run.confine_failed:
+            return run.confine_failed
+        if "child_hello" not in run.seen:
+            return "请求 S2 且本平台可内核强制，但尚未收到 child_hello"
+        return ""
+
+    def _reject_closed(self, run: SupervisedRun, why: str) -> dict[str, Any]:
+        self._mark_confine_failure(run, why)
+        return self._reject(run, why)
+
     def _dispatch(self, msg: dict[str, Any], run: SupervisedRun) -> dict[str, Any]:
-        kind = msg.get("type", "")
+        kind = str(msg.get("type", ""))
+        if kind in self._ONCE:
+            if kind in run.seen:
+                return self._reject(run, f"{kind} 只受理一次")
+            if kind in ("run_result", "run_failed") and ({"run_result", "run_failed"} & run.seen):
+                return self._reject(run, "运行结果已提交")
+            run.seen.add(kind)
+
         if kind == "child_hello":
             run.confinement_claimed = dict(msg.get("confinement", {}))
-            run.confinement_verified = verify_child_confinement(int(msg.get("pid", 0)))
+            # pid 用本进程拉起时拿到的那个：子进程自报的 pid 可以指向任意别的进程
+            run.confinement_verified = verify_child_confinement(run.child_pid)
+            self._assess_confinement(run)
             return {"type": "hello_ack"}
         if kind == "llm_request":
-            return self._llm(msg)
+            if why := self._confine_block(run):
+                return self._reject_closed(run, why)
+            return self._llm(msg, run)
         if kind == "run_result":
             run.result = dict(msg.get("result", {}))
             return {"type": "result_ack"}
         if kind == "run_failed":
-            run.error = str(msg.get("error", ""))
+            if not run.confine_failed:
+                run.error = str(msg.get("error", ""))
             return {"type": "result_ack"}
-        return self.broker.handle(msg)
 
-    def _llm(self, msg: dict[str, Any]) -> dict[str, Any]:
+        if kind == "session_start":
+            if self._s2_os_required() and "child_hello" not in run.seen:
+                self._mark_confine_failure(run, "child_hello 未在 session_start 之前到达")
+            return self.broker.handle({"type": "session_start", "session": run.session, "task": run.task})
+        if "session_start" not in run.seen:
+            return self._reject(run, f"会话未开始，拒绝 {kind}")
+        if "session_end" in run.seen and kind != "checkpoint":
+            return self._reject(run, f"会话已结束，拒绝 {kind}")
+        if kind in ("freeze_manifest", "session_end") or kind in self._PASSTHROUGH:
+            if kind == "tool_call":
+                if why := self._confine_block(run):
+                    return self._reject_closed(run, why)
+            return self.broker.handle(msg)
+        return self._reject(run, f"未知消息类型 {kind}")
+
+    def _llm(self, msg: dict[str, Any], run: SupervisedRun) -> dict[str, Any]:
         """代办模型推理。只转发，不解释内容——TCB 不因此承担语义职责。"""
+        op = str(msg.get("op", ""))
+        self.broker.audit.append(
+            "llm_request",
+            self.broker.policy_hash,
+            session=run.session,
+            op=op,
+            args_digest=_llm_request_digest(msg),
+        )
         if self.llm is None:
             return {"type": "error", "error": "父进程未配置模型后端"}
         self._llm_calls += 1
         try:
-            op = str(msg.get("op", ""))
             if op == "plan":
                 out = self.llm.plan(str(msg.get("task", "")), list(msg.get("tools", [])))
             elif op == "act":
@@ -215,7 +329,9 @@ class Supervisor:
         mock_spec: dict[str, Any] | None = None,
     ) -> SupervisedRun:
         t0 = time.perf_counter()
-        run = SupervisedRun(task=task, session=session or "", confine_requested=self.confine)
+        run = SupervisedRun(
+            task=task, session=session or "s-" + uuid.uuid4().hex[:6], confine_requested=self.confine,
+        )
         # 密钥必须趁锚还活着取走；ephemeral 下进程一退出就再也拿不回来
         run.verify_key = self.broker.anchor.export_key()
 
@@ -234,9 +350,8 @@ class Supervisor:
             "--confine", self.confine,
             "--max-steps", str(max_steps),
             "--llm", "mock" if self.llm is None else "proxy",
+            "--session", run.session,
         ]
-        if session:
-            argv += ["--session", session]
         if mock_spec:
             argv += ["--mock-spec", json.dumps(mock_spec, ensure_ascii=False)]
         if not self.verbose:
@@ -254,6 +369,7 @@ class Supervisor:
             bufsize=1,
         )
         assert proc.stdin and proc.stdout
+        run.child_pid = proc.pid
         try:
             for line in proc.stdout:
                 line = line.strip()
@@ -275,14 +391,15 @@ class Supervisor:
             except Exception:
                 proc.kill()
 
-        run.session = str(run.result.get("session", session or ""))
         run.mode = str(run.result.get("mode", ""))
         run.anchor = str(run.result.get("anchor", ""))
         run.audit_head = str(run.result.get("audit_head", "")) or self.broker.audit.head
         run.checkpoint = self.broker.anchor.chain_checkpoint()
         run.llm_calls = self._llm_calls
         run.wall_ms = (time.perf_counter() - t0) * 1000
-        if not run.result and not run.error:
+        if run.confine_failed:
+            run.error = run.confine_failed
+        elif not run.result and not run.error:
             run.error = "子进程未返回运行结果"
         return run
 

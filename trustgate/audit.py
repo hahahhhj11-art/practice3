@@ -109,10 +109,27 @@ class AuditLog:
             return [json.loads(ln) for ln in fh if ln.strip()]
 
 
+def canonical_payload(payload: dict[str, Any]) -> bytes:
+    """payload 的规范化序列化——审计链哈希的输入之一。
+
+    这是全项目 JSON 规范化的**唯一权威**。T0/T1 的锚与离机校验器都在
+    Python 侧调用本函数；T2 的 TA 在 C 侧重算摘要时，host 侧先把本函数的
+    输出原文经 base64 传给 TA，TA 不解析 JSON、只做 sha256 拼接。这样
+    就不存在 C/Python 两套序列化规则悄悄漂移的问题（docs/06 §3）。
+    """
+    return _canonical(payload)
+
+
 def chain_record(prev_hash: str, seq: int, payload: dict[str, Any]) -> str:
-    """链上单条记录的哈希。锚与校验器必须用同一个函数，否则校验恒失败。"""
-    body = {"seq": seq, **payload}
-    return sha256_hex(prev_hash.encode() + b"|" + _canonical(body))
+    """链上单条记录的哈希。锚与校验器必须用同一个函数，否则校验恒失败。
+
+    公式与 docs/02-系统架构.md §5.3 一致：
+        sha256(prev_hash || seq || canonical_payload)
+    seq 以十进制明文参与拼接（不混入 payload 的规范化序列化），为的是让
+    TEE 内的 TA 无需解析 JSON 即可重算同一摘要。
+    """
+    body = prev_hash.encode() + b"|" + str(seq).encode() + b"|" + canonical_payload(payload)
+    return sha256_hex(body)
 
 
 def verify_chain(

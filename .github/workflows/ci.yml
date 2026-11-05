@@ -4,17 +4,19 @@
 # **把跨平台的能力差原样展示出来。**
 #
 # TrustGate 的非绕过性（SC5）在 Linux 上是内核强制的——Landlock 做路径粒度的
-# 文件系统白名单，seccomp-BPF 拒绝 AF_INET/AF_INET6 的 socket()，于是被剥权的
-# Agent 进程无论执行什么代码都读不到 sandbox/、写不了盘、连不上网。Windows 上
-# 没有等价机制：能做到的只有 Job Object 的生命周期与派生约束，文件与网络
-# **没有**内核兜底，因此 apply_confinement("S2") 会如实降级成 S1。
+# 文件系统白名单，seccomp-BPF 拒绝新建套接字（含 AF_UNIX）以及 io_uring 的
+# setup/enter/register，于是被剥权的 Agent 进程无论执行什么代码都读不到
+# sandbox/、写不了盘、开不出 socket。Windows 上没有等价机制：能做到的只有
+# Job Object 的生命周期与派生约束，文件与网络 **没有**内核兜底，因此
+# apply_confinement("S2") 会如实降级成 S1。
 #
 # 这不是"Windows 支持还没做完"，是平台能力差，项目选择如实记录而不是用措辞
 # 含糊过去（见 trustgate/confine.py 模块注释与 ConfinementReport.gaps）。
 # 具体表现：
 #   · ubuntu-latest 的内核带 Landlock，tests/test_confinement.py 里
-#     OsEnforcedConfinementTest 那几条**真的会执行**，断言内核确实拒绝了
-#     三条绕过路径（连"写盘没留下痕迹"都由父进程亲自查文件系统取证）；
+#     OsEnforcedConfinementTest 那几条**真的会执行**，断言内核拒绝了全部
+#     适用的绕过路径（连"写盘没留下痕迹"都由父进程亲自查文件系统取证；
+#     本内核不适用的尝试标 not_applicable，不算拦截）；
 #   · windows-latest 上同一批用例走 self.skipTest() 主动跳过，跳过理由里
 #     写明这是已登记的能力缺口。
 #
@@ -62,6 +64,12 @@ jobs:
       # 依赖安装——一旦出现，就说明有人偷偷加了依赖。
       - name: 确认零运行时依赖
         shell: bash
+        env:
+          # 与其他 print 中文的步骤同理（见 confine.probe 一节的注释）：
+          # Windows runner 默认 cp1252，不设这两个变量，print 直接抛
+          # UnicodeEncodeError，这一步会"莫名"失败。
+          PYTHONUTF8: "1"
+          PYTHONIOENCODING: "utf-8"
         run: |
           python - <<'PY'
           import tomllib
@@ -99,21 +107,49 @@ jobs:
           PYTHONIOENCODING: "utf-8"
         run: python -m unittest discover -s tests -p "test_*.py" -t . -v
 
-      # 非绕过性的 S0 对照组在所有平台上都必须成立：三条绕过路径本来确实
-      # 走得通。这一格与平台无关——它证明的是"路径可达"，而不是"防御生效"。
-      # 只有它成立，S2 在 Linux 上的 0/3 才有参照。
-      - name: 非绕过性 S0 对照组（三条绕过路径必须全部可用）
+      # 非绕过性的 S0 对照组在所有平台上都必须成立：读密钥、写盘、开 INET
+      # socket 这三条本来确实走得通。AF_UNIX / io_uring / x32 只在本内核适用
+      # 时才要求成功；not_applicable 不能算进「被拦截」。只有适用路径在 S0
+      # 下全部成功，S2 在 Linux 上的 0 才有参照。
+      - name: 非绕过性 S0 对照组（适用的绕过路径必须全部可用）
         shell: bash
         env:
           PYTHONUTF8: "1"
           PYTHONIOENCODING: "utf-8"
         run: |
           python -m trustgate.sandbox build
-          python -c "import json,subprocess,sys; out=subprocess.run([sys.executable,'scripts/bypass_demo.py','--level','S0','--json'],capture_output=True,text=True,encoding='utf-8',check=True).stdout; n=json.loads(out)['bypass_count']; print('S0 bypass_count =', n); sys.exit(0 if n==3 else 'S0 对照组失效：无 S0 基线则 S2 的拦截结果失去参照')"
+          python - <<'PY'
+          import json, subprocess, sys
+          out = subprocess.run(
+              [sys.executable, "scripts/bypass_demo.py", "--level", "S0", "--json"],
+              capture_output=True, text=True, encoding="utf-8", check=True,
+          ).stdout
+          got = json.loads(out)
+          core = ("A_read_sandbox_secret", "B_write_filesystem", "C_open_inet_socket")
+          attempts = got["attempts"]
+          problems = []
+          for name in core:
+              row = attempts.get(name) or {}
+              if row.get("not_applicable") or not row.get("bypassed"):
+                  problems.append(f"{name} 在 S0 下不可用")
+          applicable = [n for n, r in attempts.items() if not r.get("not_applicable")]
+          if got["bypass_count"] != len(applicable):
+              problems.append(
+                  f"bypass_count={got['bypass_count']} 与适用条数 {len(applicable)} 不一致"
+              )
+          if any(r.get("not_applicable") and r.get("bypassed") for r in attempts.values()):
+              problems.append("not_applicable 被计成了绕过")
+          if any(not attempts[n]["bypassed"] for n in applicable):
+              problems.append("有适用路径在 S0 下没有成功")
+          print("S0 bypass_count =", got["bypass_count"], "applicable =", len(applicable))
+          if problems:
+              print(json.dumps(attempts, ensure_ascii=False, indent=2))
+              raise SystemExit("S0 对照组失效：" + "；".join(problems))
+          PY
 
-      # 只在 Linux 上跑：这一格断言 S2 下三条绕过全部被内核拒绝。放到
-      # Windows 上必然失败（S2 会降级成 S1），而那个失败没有任何信息量——
-      # 它要测的机制在那个平台上根本不存在。
+      # 只在 Linux 上跑：适用的绕过路径必须全部被内核拒绝。放到 Windows 上
+      # 必然失败（S2 会降级成 S1），而那个失败没有任何信息量——它要测的
+      # 机制在那个平台上根本不存在。not_applicable 不算拦截。
       - name: 内核级权限剥离（S2 · 仅 Linux）
         if: runner.os == 'Linux'
         shell: bash
@@ -121,7 +157,36 @@ jobs:
           PYTHONUTF8: "1"
           PYTHONIOENCODING: "utf-8"
         run: |
-          python -c "import json,subprocess,sys; out=subprocess.run([sys.executable,'scripts/bypass_demo.py','--level','S2','--json'],capture_output=True,text=True,encoding='utf-8',check=True).stdout; r=json.loads(out); print(json.dumps(r['confinement'], ensure_ascii=False, indent=2)); print('S2 bypass_count =', r['bypass_count']); sys.exit(0 if (r['bypass_count']==0 and r['confinement']['os_enforced']) else 'S2 未达成内核强制')"
+          python - <<'PY'
+          import json, subprocess, sys
+          out = subprocess.run(
+              [sys.executable, "scripts/bypass_demo.py", "--level", "S2", "--json"],
+              capture_output=True, text=True, encoding="utf-8", check=True,
+          ).stdout
+          got = json.loads(out)
+          core = ("A_read_sandbox_secret", "B_write_filesystem", "C_open_inet_socket")
+          attempts = got["attempts"]
+          problems = []
+          if not (got["bypass_count"] == 0 and got["confinement"]["os_enforced"]):
+              problems.append("S2 未达成内核强制")
+          applicable = []
+          for name, row in attempts.items():
+              if row.get("not_applicable"):
+                  if row.get("bypassed"):
+                      problems.append(f"{name} 标了不适用却又算绕过")
+                  continue
+              applicable.append(name)
+              if row.get("bypassed"):
+                  problems.append(f"{name} 在 S2 下仍绕过")
+          for name in core:
+              if name not in applicable:
+                  problems.append(f"{name} 被标成不适用，拦截没有对照")
+          print(json.dumps(got["confinement"], ensure_ascii=False, indent=2))
+          print("S2 bypass_count =", got["bypass_count"], "applicable =", len(applicable))
+          if problems:
+              print(json.dumps(attempts, ensure_ascii=False, indent=2))
+              raise SystemExit("；".join(problems))
+          PY
 
       # Windows 侧的对应断言：不要求它拦住，只要求它**别谎报**。降级时
       # effective 必须不是 S2、os_enforced 必须为假、gaps 必须非空。
@@ -161,3 +226,24 @@ jobs:
             logs/*.json
             logs/*.jsonl
           if-no-files-found: warn
+
+  # agentdojo 是第三方基准，只有适配层的测试需要它。核心矩阵保持零依赖、
+  # 在那里这组测试按缺包跳过；这一格单独装包，并用 TG_REQUIRE_AGENTDOJO
+  # 把「缺包跳过」变成失败，免得它在所有格上都静默跳过。不调用任何模型。
+  agentdojo-adapter:
+    name: AgentDojo 适配层（ubuntu · 装 requirements.txt）
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: pip install -r requirements.txt
+        run: python -m pip install -r requirements.txt
+      - name: 适配层离线测试
+        shell: bash
+        env:
+          PYTHONUTF8: "1"
+          PYTHONIOENCODING: "utf-8"
+          TG_REQUIRE_AGENTDOJO: "1"
+        run: python -m unittest tests.test_agentdojo_adapter -v

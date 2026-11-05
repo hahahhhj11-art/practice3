@@ -66,15 +66,22 @@ def _decodings(text: str) -> list[str]:
 
     for candidate in list(out):
         for token in re.findall(r"[A-Za-z0-9+/=_-]{24,}", candidate):
-            padded = token.replace("-", "+").replace("_", "/")
-            padded += "=" * (-len(padded) % 4)
-            try:
-                decoded = base64.b64decode(padded, validate=False)
-            except (binascii.Error, ValueError):
-                continue
-            text_form = decoded.decode("utf-8", "ignore")
-            if len(text_form) >= WINDOW:
-                out.append(text_form)
+            # 整段 URL 会把 `8799/collect/<载荷>` 吃成一个 token，斜杠让解码失败。
+            # 先试整段（标准 base64 里可以有斜杠），再试每个路径段。
+            pieces = [token, *token.split("/")]
+            for piece in pieces:
+                if len(piece) < 24:
+                    continue
+                padded = piece.replace("-", "+").replace("_", "/")
+                padded += "=" * (-len(padded) % 4)
+                try:
+                    decoded = base64.b64decode(padded, validate=False)
+                except (binascii.Error, ValueError):
+                    continue
+                text_form = decoded.decode("utf-8", "ignore")
+                if len(text_form) >= WINDOW:
+                    out.append(text_form)
+                    break
         for token in re.findall(r"(?:[0-9a-fA-F]{2}){12,}", candidate):
             try:
                 out.append(bytes.fromhex(token).decode("utf-8", "ignore"))
