@@ -93,6 +93,8 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--user-task", action="append", default=[], help="只跑这些用户任务 id，可重复")
     ap.add_argument("--audit", default="logs/agentdojo-audit.jsonl")
     ap.add_argument("--logdir", default="logs/agentdojo-runs", help="AgentDojo 逐条轨迹的落盘目录")
+    ap.add_argument("--resume", action="store_true",
+                    help="logdir 里已有结果的任务对直接读盘，不再调用模型。中断后续跑用")
     ns = ap.parse_args(argv)
 
     if not os.environ.get("TG_API_KEY", "").strip():
@@ -124,6 +126,8 @@ def _run(ns: argparse.Namespace) -> int:
     client = openai.OpenAI(
         api_key=os.environ["TG_API_KEY"],
         base_url=(os.environ.get("TG_BASE_URL") or "https://api.openai.com/v1").rstrip("/"),
+        # 一次 DNS 抖动就让整套件中断，已跑完的任务对要靠 --resume 才捡得回来
+        max_retries=8,
     )
     sig_client = ThoughtSignatureClient(client)
     llm = OpenAILLM(sig_client, ns.model)  # type: ignore[arg-type]
@@ -153,7 +157,7 @@ def _run(ns: argparse.Namespace) -> int:
             suite,
             attack,
             logdir=logdir,
-            force_rerun=True,
+            force_rerun=not ns.resume,
             user_tasks=user_tasks,
             benchmark_version=ns.version,
         )
