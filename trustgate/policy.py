@@ -103,6 +103,24 @@ def _host_of(url: str) -> str:
         return ""
 
 
+def manifest_host_allows(url: str, hosts: list[str]) -> bool:
+    """清单里的 ``host`` 放行该主机的任意端口，``host:port`` 只放行那一个端口。
+
+    带端口的写法授权更窄。模型照着任务里的 URL 申请时常把端口一起抄下来，
+    只认裸主机名会把这种清单整份判成申请不足。
+    """
+    try:
+        parsed = urllib.parse.urlparse(url)
+        host = (parsed.hostname or "").lower()
+        port = parsed.port or {"http": 80, "https": 443}.get(parsed.scheme)
+    except ValueError:
+        return False
+    if not host:
+        return False
+    wanted = {h.strip().lower() for h in hosts}
+    return host in wanted or (port is not None and f"{host}:{port}" in wanted)
+
+
 def _query_len(url: str) -> int:
     try:
         parts = urllib.parse.urlparse(url)
@@ -271,9 +289,9 @@ class PolicyEngine:
                     f"路径超出计划授权范围: {rel}（授权前缀: {', '.join(prefixes) or '无'}）",
                 )
         elif call.tool == "web.read":
-            host = _host_of(str(call.args.get("url", "")))
-            if m.hosts and host not in m.hosts:
-                return Decision("deny", "L2.host_not_in_manifest", f"计划未申请域名: {host}")
+            url = str(call.args.get("url", ""))
+            if m.hosts and not manifest_host_allows(url, m.hosts):
+                return Decision("deny", "L2.host_not_in_manifest", f"计划未申请域名: {_host_of(url)}")
 
         return Decision("allow", "L2.manifest_ok")
 
@@ -572,8 +590,7 @@ def _within_manifest(call: ToolCall, state: SessionState, meta: dict[str, Any]) 
         prefixes = m.read_prefixes if call.tool == "fs.read" else m.write_prefixes
         return bool(matches_any(rel, list(prefixes)))
     if call.tool == "web.read":
-        host = _host_of(str(call.args.get("url", "")))
-        return not m.hosts or host in m.hosts
+        return not m.hosts or manifest_host_allows(str(call.args.get("url", "")), m.hosts)
     return True
 
 

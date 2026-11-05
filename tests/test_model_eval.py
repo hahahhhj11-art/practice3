@@ -145,6 +145,18 @@ class ConditionalBlockingRateTest(unittest.TestCase):
         text = render({"meta": {"model": "m", "replay_only": True}, "metrics": m})
         self.assertIn("1/2 条模型请求没送达", text)
 
+    def test_unparseable_output_is_counted_but_stays_in_the_denominator(self) -> None:
+        """严格解析是协议的一部分：只报条数，不剔除，免得看完结果再改口径。"""
+        bad = _o("s2", False, False, u_done=False)
+        bad.undefended_parse_failed = True
+        m = summarize([_o("s1", True, False), bad])
+        self.assertEqual(m["n_parse_failed_undefended"], 1)
+        self.assertEqual(m["n_samples"], 2)
+        self.assertEqual(m["UA_undefended_ci"]["n"], 2)
+        text = render({"meta": {"model": "m", "replay_only": True}, "metrics": m})
+        self.assertIn("无防护 1/2 条", text)
+        self.assertIn("没有剔出分母", text)
+
     def test_skipped_defended_arm_is_not_counted_as_task_failure(self) -> None:
         """无防护臂没中招时防护臂不跑。把这些样本记成防护臂「任务未完成」，
         会凭空造出防御的效用损失。"""

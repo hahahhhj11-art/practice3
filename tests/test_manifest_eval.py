@@ -75,6 +75,77 @@ class ManifestCompareTest(unittest.TestCase):
         self.assertTrue(row["over_request"])
         self.assertFalse(row["under_request"])
 
+    def test_host_with_port_is_judged_like_l2_enforces_it(self) -> None:
+        from trustgate.policy import manifest_host_allows
+
+        self.assertTrue(manifest_host_allows("http://127.0.0.1:8799/x", ["127.0.0.1"]))
+        self.assertTrue(manifest_host_allows("http://127.0.0.1:8799/x", ["127.0.0.1:8799"]))
+        self.assertFalse(manifest_host_allows("http://127.0.0.1:8800/x", ["127.0.0.1:8799"]),
+                         "带端口的申请只放行那一个端口")
+        self.assertTrue(manifest_host_allows("https://example.com/x", ["example.com:443"]))
+
+        sample = benign_sample(1)
+        self.assertTrue(sample["benign_plan"]["urls"])
+        same = dict(sample["reference_manifest"], hosts=["127.0.0.1:8799"])
+        row = compare_manifest(sample, same)
+        self.assertFalse(row["under_request"], row)
+        self.assertFalse(row["over_request"], row)
+        wrong = dict(sample["reference_manifest"], hosts=["127.0.0.1:9999"])
+        self.assertTrue(compare_manifest(sample, wrong)["under_request"])
+
+    def test_denied_step_is_not_completed_even_if_the_file_is_written(self) -> None:
+        """MockLLM 被拒之后照写输出文件。只看文件会把没读到网页的摘要记成完成。"""
+        sample = benign_sample(1)
+        wrong = dict(sample["reference_manifest"], hosts=["127.0.0.1:9999"])
+        httpd, collector = serve_in_background(
+            port=8799, log_path=ROOT / "logs" / "manifest-test-collector.jsonl"
+        )
+        completes_under._collector = collector  # type: ignore[attr-defined]
+        work = ROOT / "logs" / "manifest-test-work"
+        work.mkdir(parents=True, exist_ok=True)
+        try:
+            self.assertFalse(completes_under(sample, wrong, work))
+            self.assertTrue(completes_under(sample, dict(wrong, hosts=["127.0.0.1:8799"]), work))
+        finally:
+            completes_under._collector = None  # type: ignore[attr-defined]
+            httpd.shutdown()
+            httpd.server_close()
+
+    def test_unparseable_and_lost_answers_stay_out_of_under_request(self) -> None:
+        """拿不出清单若被当成空清单，格式问题会被记成防御的申请不足。"""
+        from eval.manifest_eval import ManifestUnparseable, evaluate
+        from trustgate.llm import LLMTransportError
+
+        samples = [benign_sample(1), benign_sample(2), benign_sample(3)]
+        answers = {
+            samples[0]["task"]: dict(samples[0]["reference_manifest"]),
+            samples[1]["task"]: ManifestUnparseable("模型输出无法解析为 JSON"),
+            samples[2]["task"]: LLMTransportError("模型通道故障"),
+        }
+
+        def propose(task: str) -> dict:
+            got = answers[task]
+            if isinstance(got, Exception):
+                raise got
+            return got
+
+        report = evaluate(propose, samples=samples)
+        self.assertEqual(report["n_attempted"], 3)
+        self.assertEqual(report["n_transport_failed"], 1)
+        self.assertEqual((report["unparseable"]["k"], report["unparseable"]["n"]), (1, 2))
+        self.assertEqual(report["n"], 1)
+        self.assertEqual(report["under_request"]["k"], 0)
+        self.assertEqual(report["under_request"]["n"], 1)
+
+    def test_parse_error_marker_is_not_read_as_a_manifest(self) -> None:
+        from unittest import mock
+
+        from eval.manifest_eval import ManifestUnparseable, propose_manifest
+
+        with mock.patch("trustgate.llm.OpenAICompatibleLLM._chat", return_value="{'tools': ['fs.read']}"):
+            with self.assertRaises(ManifestUnparseable):
+                propose_manifest("读 README", "m")
+
 
 class ManifestScriptTest(unittest.TestCase):
     def test_missing_key_exits_3_without_rates(self) -> None:
