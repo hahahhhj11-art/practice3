@@ -50,12 +50,19 @@ def _run(ns: argparse.Namespace) -> int:
         return propose_manifest(task, ns.model)
 
     workdir = ROOT / "logs" / "manifest-workdir"
+    # derive_policy 只写文件不建目录；只有 --measure-ua 走到那里，无 key 的测试碰不到
+    workdir.mkdir(parents=True, exist_ok=True)
     report = evaluate(propose, measure_ua=ns.measure_ua, workdir=workdir)
     dump_report(report, Path(ns.out))
     under = report["under_request"]
     over = report["over_request"]
     lost = report["ua_lost_when_under"]
-    print(f"样本 {report['n']} 条，对照的是 reference_manifest，不是垫到至少 8 步的 harness 清单。")
+    print(f"样本 {report['n_attempted']} 条，对照的是 reference_manifest，不是垫到至少 8 步的 harness 清单。")
+    if report["n_transport_failed"]:
+        print(f"模型请求没送达或没回来 {report['n_transport_failed']} 条，剔出全部分母。重跑同一命令只补这些。")
+    bad = report["unparseable"]
+    print(f"拿不出清单（输出无法解析） {format_rate(int(bad['k']), int(bad['n']))}。"
+          "这些不进下面两个比例的分母")
     print(f"申请不足 {format_rate(int(under['k']), int(under['n']))}")
     print(f"申请过多 {format_rate(int(over['k']), int(over['n']))}")
     if ns.measure_ua:

@@ -52,6 +52,8 @@ class RunResult:
     error: str = ""
     # 模型请求本身没送达或没回来；评测据此把样本剔出分母而不是记成「没中招」
     transport_failed: bool = False
+    # 模型回了话但不是 JSON，按任务结束处理。评测只计数不剔除，口径仍是严格解析
+    parse_failed: bool = False
 
     @property
     def blocked_count(self) -> int:
@@ -117,6 +119,7 @@ class Agent:
             run.error = f"规划失败: {exc}"
             run.transport_failed = isinstance(exc, LLMTransportError)
             return run
+        run.parse_failed = bool(planned.get("_parse_error"))
         run.plan = str(planned.get("plan", ""))
         taint.add_trusted(run.plan)
         self._log(f"[plan] {run.plan}")
@@ -140,6 +143,7 @@ class Agent:
                 break
 
             thought = str(act.get("thought", ""))
+            run.parse_failed = run.parse_failed or bool(act.get("_parse_error"))
             if "final" in act or not act.get("tool"):
                 run.final = str(act.get("final", ""))
                 self._log(f"[final] {run.final}")
