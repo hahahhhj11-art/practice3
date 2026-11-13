@@ -28,6 +28,7 @@ from eval.run_model_eval import (  # noqa: E402
     preflight,
     render,
     summarize,
+    variance_summary,
 )
 
 
@@ -364,6 +365,49 @@ class ArmPlumbingTest(unittest.TestCase):
         self.assertTrue(o.informative)
         self.assertTrue(o.blocked_by_gateway)
         self.assertEqual(summarize([o])["conditional_blocking_rate"], 100.0)
+
+
+class VarianceSummaryTest(unittest.TestCase):
+    def _run_metrics(self, *outcome_groups: list[PairedOutcome]) -> list[dict]:
+        return [summarize(g) for g in outcome_groups]
+
+    def test_mean_and_sample_std_across_runs(self) -> None:
+        # 两轮：CBR 一轮 100%（1/1），一轮 0%（0/1）→ mean 50, std 70.71
+        run1 = self._run_metrics([_o("s1", True, False)])
+        run2 = self._run_metrics([_o("s1", True, True)])
+        v = variance_summary(run1 + run2)
+        self.assertEqual(v["conditional_blocking_rate"]["mean"], 50.0)
+        self.assertAlmostEqual(v["conditional_blocking_rate"]["std"], 70.71, places=2)
+        self.assertEqual(v["conditional_blocking_rate"]["min"], 0.0)
+        self.assertEqual(v["conditional_blocking_rate"]["max"], 100.0)
+
+    def test_none_runs_are_excluded_from_variance(self) -> None:
+        # 一轮模型完全没中招 → CBR 是 None，不能参与也不能报错
+        run1 = self._run_metrics([_o("s1", True, False)])
+        run2 = self._run_metrics([_o("s1", False, False)])
+        v = variance_summary(run1 + run2)
+        self.assertEqual(v["conditional_blocking_rate"]["n_runs"], 1)
+        self.assertEqual(v["conditional_blocking_rate"]["std"], 0.0)
+
+    def test_render_shows_variance_block_for_multi_run(self) -> None:
+        run1 = self._run_metrics([_o("s1", True, False), _o("s2", True, True)])
+        run2 = self._run_metrics([_o("s1", True, False), _o("s2", True, True)])
+        text = render({
+            "meta": {"model": "m", "replay_only": True, "runs": 2, "temperature": 1.0},
+            "metrics": summarize([_o("s1", True, False), _o("s2", True, True)]),
+            "variance": variance_summary(run1 + run2),
+        })
+        self.assertIn("重复 2 轮", text)
+        self.assertIn("mean=", text)
+
+    def test_render_omits_variance_block_for_single_run(self) -> None:
+        m = summarize([_o("s1", True, False)])
+        text = render({
+            "meta": {"model": "m", "replay_only": True, "runs": 1, "temperature": 0.0},
+            "metrics": m,
+            "variance": None,
+        })
+        self.assertNotIn("轮级波动", text)
 
 
 if __name__ == "__main__":
