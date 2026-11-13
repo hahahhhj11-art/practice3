@@ -127,8 +127,10 @@ def preflight(model: str, probe_network: bool, cache_path: str = "logs/llm_cache
 
     # 连通性探测用最短的一次真实请求，而不是去 ping 域名：真正会失败的是
     # 鉴权与配额，不是 DNS。探测结果本身也进缓存，所以这一次不算浪费。
+    # temperature=1：部分模型（如 Kimi k3 系列）只接受整数 1，探测不该在
+    # 采样参数上翻车——要探的是鉴权与配额，不是温度。
     try:
-        llm = OpenAICompatibleLLM(model=model, temperature=0.0)
+        llm = OpenAICompatibleLLM(model=model, temperature=1)
         llm._chat([{"role": "user", "content": "ok"}])
         pf.reachable = True
     except Exception as exc:
@@ -245,6 +247,39 @@ def summarize(attempted: list[PairedOutcome]) -> dict[str, Any]:
     }
 
 
+def variance_summary(per_run: list[dict[str, Any]]) -> dict[str, Any]:
+    """轮级比率的 mean±std。None（如该轮无易感样本导致 CBR 不可计算）不参与。"""
+    keys = {
+        "model_susceptibility": "模型易感性 S",
+        "ASR_model": "ASR@model",
+        "conditional_blocking_rate": "条件阻断率 CBR",
+        "UA_defended": "任务效用 UA（全防护）",
+        "UA_undefended": "任务效用 UA（无防护）",
+    }
+    out: dict[str, Any] = {}
+    for key, label in keys.items():
+        vals = [m[key] for m in per_run if m.get(key) is not None]
+        if not vals:
+            out[key] = {"label": label, "n_runs": 0, "mean": None, "std": None}
+            continue
+        mean = sum(vals) / len(vals)
+        if len(vals) > 1:
+            var = sum((v - mean) ** 2 for v in vals) / (len(vals) - 1)
+            std = round(var ** 0.5, 2)
+        else:
+            std = 0.0
+        out[key] = {
+            "label": label,
+            "n_runs": len(vals),
+            "mean": round(mean, 1),
+            "std": std,
+            "min": round(min(vals), 1),
+            "max": round(max(vals), 1),
+            "per_run": [round(v, 1) for v in vals],
+        }
+    return out
+
+
 def _fmt_ci(ci: dict[str, Any] | None) -> str:
     if not ci:
         return "—"
@@ -318,8 +353,27 @@ def render(report: dict[str, Any]) -> str:
         )
     if m["blocking_rules"]:
         out += ["", "  实际生效的拦截规则（只统计模型真的中招那些样本）："]
+    if m["blocking_rules"]:
+        out += ["", "  实际生效的拦截规则（只统计模型真的中招那些样本）："]
         for rule, cnt in m["blocking_rules"].items():
             out.append(f"    {cnt:>3}  {rule}")
+    if report.get("variance"):
+        out += [
+            "",
+            f"  同一模型重复 {report['meta']['runs']} 轮（temperature="
+            f"{report['meta']['temperature']}）的轮级波动：",
+        ]
+        for key, v in report["variance"].items():
+            if not v["n_runs"]:
+                out.append(f"    {v['label']}  全部轮次均不可计算")
+                continue
+            out.append(
+                f"    {v['label']}  mean={v['mean']}% ± {v['std']}%"
+                f"（min={v['min']} max={v['max']}，{v['n_runs']} 轮）"
+            )
+        out += [
+            "  顶层指标为合并全部轮次的计数；需要轮级区间时对 per_run 逐轮算 Wilson。",
+        ]
     return "\n".join(out)
 
 
@@ -357,6 +411,15 @@ def main() -> int:
                          "因此实际模型调用量约为 2×limit×步数")
     ap.add_argument("--targets", help="只跑指定攻击类别")
     ap.add_argument("--evasions", help="只跑指定规避层级")
+    ap.add_argument("--runs", type=int, default=1,
+                    help="同一批样本重复跑几轮（测同一模型多次运行的方差）。"
+                         "每轮重新过一遍两臂取样流程")
+    ap.add_argument("--temperature", type=float, default=None,
+                    help="采样温度；缺省保持后端默认 0.0。--runs>1 时若仍是 0.0，"
+                         "各轮输出确定性一致，方差恒为 0——测方差必须传 >0")
+    ap.add_argument("--no-cache", action="store_true",
+                    help="禁用 LLM 录制缓存（--runs>1 的方差实验必须开启）。否则同一请求"
+                         "第二轮起全部命中缓存，各轮结果逐字节一致，方差恒为 0")
     ap.add_argument("--replay-only", action="store_true",
                     help="只用录制缓存，绝不联网；缓存缺失即报错而不是偷偷发请求")
     ap.add_argument("--preflight", action="store_true", help="只做环境预检，不跑实验")
@@ -404,12 +467,33 @@ def main() -> int:
         ns.targets.split(",") if ns.targets else None,
         ns.evasions.split(",") if ns.evasions else None,
     )
-    print(f"\n样本 {len(samples)} 条 × 两臂（{ARM_UNDEFENDED} 无防护 / {ARM_DEFENDED} 全防护）")
+    print(f"\n样本 {len(samples)} 条 × 两臂（{ARM_UNDEFENDED} 无防护 / {ARM_DEFENDED} 全防护）"
+          + (f" × {ns.runs} 轮" if ns.runs > 1 else ""))
+    if ns.runs > 1 and not ns.temperature:
+        print("  ⚠ --runs>1 但 temperature 仍为 0.0（缺省）：采样确定性，各轮结果将逐字节一致，"
+              "方差恒为 0。测同一模型多次运行的方差请传 --temperature 1.0 或模型默认值。",
+              flush=True)
+    if ns.runs > 1 and not ns.no_cache and not ns.replay_only:
+        print("  ⚠ --runs>1 在线实验未加 --no-cache：第二轮起相同请求将命中录制缓存，"
+              "返回首轮响应，轮间方差恒为 0。测方差请加 --no-cache。",
+              flush=True)
 
     def llm_factory(_sample: dict[str, Any]) -> LLMBackend:
         # 每条样本新建实例，但缓存是进程内共享读 + 追加写，所以两臂之间、
-        # 样本之间的相同请求只会真正打一次网络。
-        return OpenAICompatibleLLM(model=ns.model, replay_only=ns.replay_only)
+        # 样本之间的相同请求只会真正打一次网络。temperature 进缓存 key，
+        # 不同温度的请求互不串味。
+        temp = ns.temperature
+        if temp is not None and temp == int(temp):
+            # Kimi k3 系列要求 temperature 精确为整数 1，json 序列化 1.0 会被 400。
+            temp = int(temp)
+        return OpenAICompatibleLLM(
+            model=ns.model,
+            temperature=temp if temp is not None else 0.0,
+            replay_only=ns.replay_only,
+            # 方差实验必须绕开录制缓存：缓存按（模型, 温度, 消息）键控，命中即
+            # 返回旧响应，重复轮次不再产生新的采样，轮间方差被压成 0。
+            cache_path=os.devnull if ns.no_cache else "logs/llm_cache.jsonl",
+        )
 
     from scripts.serve_corpus import serve_in_background
 
@@ -421,76 +505,96 @@ def main() -> int:
     audit_dir.mkdir(parents=True, exist_ok=True)
     base_policy = project_root() / ns.policy
 
-    outcomes: list[PairedOutcome] = []
+    all_runs: list[list[PairedOutcome]] = []
     try:
-        for i, sample in enumerate(samples, start=1):
-            o = PairedOutcome(
-                sample=sample["id"],
-                target=sample["target"],
-                evasion=str(sample.get("evasion", "")),
-                expect_layer=str(sample.get("expect_layer", "-")),
-                defended_ran=False,
-            )
-            for gid in (ARM_UNDEFENDED, ARM_DEFENDED):
-                try:
-                    t = run_arm(gid, sample, workdir, collector, llm_factory, audit_dir, base_policy)
-                except Exception as exc:
-                    o.errors.append(f"{gid}: {type(exc).__name__}: {exc}")
-                    continue
-                if t.error:
-                    o.errors.append(f"{gid}: {t.error}")
-                if t.transport_failed:
-                    o.transport_failed = True
-                    break
-                if gid == ARM_UNDEFENDED:
-                    o.undefended_parse_failed = t.parse_failed
-                    o.undefended_success = t.attack_success
-                    o.undefended_task_done = t.task_completed
-                else:
-                    o.defended_ran = True
-                    o.defended_parse_failed = t.parse_failed
-                    o.defended_success = t.attack_success
-                    o.defended_task_done = t.task_completed
-                    o.blocking_rule = t.blocking_rule
-                # 无防护臂就没中招时，防护臂不必再跑：它的结果对 CBR 没有贡献，
-                # 而每一臂都是真金白银的模型调用。这不是抽样偏差——被跳过的样本
-                # 本来就要从 CBR 分母里剔除，且它在 ASR@model 上按未成功计入。
-                if gid == ARM_UNDEFENDED and not t.attack_success:
-                    break
+        for run_idx in range(1, ns.runs + 1):
+            if ns.runs > 1:
+                print(f"\n── 第 {run_idx}/{ns.runs} 轮 ──", flush=True)
+            outcomes: list[PairedOutcome] = []
+            all_runs.append(outcomes)
+            for i, sample in enumerate(samples, start=1):
+                o = PairedOutcome(
+                    sample=sample["id"],
+                    target=sample["target"],
+                    evasion=str(sample.get("evasion", "")),
+                    expect_layer=str(sample.get("expect_layer", "-")),
+                    defended_ran=False,
+                )
+                for gid in (ARM_UNDEFENDED, ARM_DEFENDED):
+                    try:
+                        t = run_arm(gid, sample, workdir, collector, llm_factory, audit_dir, base_policy)
+                    except Exception as exc:
+                        o.errors.append(f"{gid}: {type(exc).__name__}: {exc}")
+                        continue
+                    if t.error:
+                        o.errors.append(f"{gid}: {t.error}")
+                    if t.transport_failed:
+                        o.transport_failed = True
+                        break
+                    if gid == ARM_UNDEFENDED:
+                        o.undefended_parse_failed = t.parse_failed
+                        o.undefended_success = t.attack_success
+                        o.undefended_task_done = t.task_completed
+                    else:
+                        o.defended_ran = True
+                        o.defended_parse_failed = t.parse_failed
+                        o.defended_success = t.attack_success
+                        o.defended_task_done = t.task_completed
+                        o.blocking_rule = t.blocking_rule
+                    # 无防护臂就没中招时，防护臂不必再跑：它的结果对 CBR 没有贡献，
+                    # 而每一臂都是真金白银的模型调用。这不是抽样偏差——被跳过的样本
+                    # 本来就要从 CBR 分母里剔除，且它在 ASR@model 上按未成功计入。
+                    if gid == ARM_UNDEFENDED and not t.attack_success:
+                        break
 
-            outcomes.append(o)
-            tag = (
-                "模型通道故障（剔出全部分母）" if o.transport_failed
-                else "模型未中招（不计入 CBR）" if not o.undefended_success
-                else ("网关拦住" if o.blocked_by_gateway else "✗ 仍然得手")
-            )
-            print(
-                f"  [{i}/{len(samples)}] {sample['id'][:44]:<44} {tag}"
-                + (f"  规则={o.blocking_rule}" if o.blocking_rule else "")
-                + (f"  错误={o.errors[-1][:50]}" if o.errors else ""),
-                flush=True,
-            )
+                outcomes.append(o)
+                tag = (
+                    "模型通道故障（剔出全部分母）" if o.transport_failed
+                    else "模型未中招（不计入 CBR）" if not o.undefended_success
+                    else ("网关拦住" if o.blocked_by_gateway else "✗ 仍然得手")
+                )
+                prefix = f"[{run_idx}/{ns.runs}·" if ns.runs > 1 else "["
+                print(
+                    f"  {prefix}{i}/{len(samples)}] {sample['id'][:44]:<44} {tag}"
+                    + (f"  规则={o.blocking_rule}" if o.blocking_rule else "")
+                    + (f"  错误={o.errors[-1][:50]}" if o.errors else ""),
+                    flush=True,
+                )
     finally:
         httpd.shutdown()
         httpd.server_close()
         if workdir.is_dir() and workdir.is_relative_to(Path(tempfile.gettempdir()).resolve()):
             shutil.rmtree(workdir, ignore_errors=True)
 
+    pooled = [o for run in all_runs for o in run]
+    per_run = [summarize(run) for run in all_runs]
     report = {
         "meta": {
             "model": ns.model,
             "base_url": pf.base_url,
             "replay_only": ns.replay_only,
+            "temperature": ns.temperature if ns.temperature is not None else 0.0,
+            "runs": ns.runs,
+            "llm_cache": "disabled (--no-cache)" if ns.no_cache else "logs/llm_cache.jsonl",
             "arms": {ARM_UNDEFENDED: "无防护（observe）", ARM_DEFENDED: "全防护"},
             "asr_semantics": (
                 "ASR@model：真实模型端到端攻击成功率，含模型自身对齐效果，不可单独"
                 "引用为网关效果。可归因给网关的是 conditional_blocking_rate（CBR），"
                 "其分母仅含在无防护臂真的中招的样本。"
             ),
+            "variance_semantics": (
+                "runs>1 时 per_run 是每一轮各自的比率，variance 是这些轮级比率"
+                "的 mean±std（std 为样本标准差，n=1 时为 0）。温度 0 下各轮确定性"
+                "一致，std 恒为 0，不代表模型本身无波动。"
+            ),
             "ts": round(time.time(), 3),
         },
-        "metrics": summarize(outcomes),
-        "outcomes": [vars(o) for o in outcomes],
+        # 顶层 metrics 为全部轮次的合并计数（n = runs × 每轮样本数）；
+        # 轮级波动看 per_run 与 variance。
+        "metrics": summarize(pooled),
+        "per_run": per_run,
+        "variance": variance_summary(per_run) if ns.runs > 1 else None,
+        "outcomes": [vars(o) for o in pooled],
     }
     out = project_root() / ns.out
     out.parent.mkdir(parents=True, exist_ok=True)

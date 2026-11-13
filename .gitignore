@@ -18,3 +18,9 @@ tee/bridge/tg_bridge_soft.exe
 tee/ta/*.o
 tee/ta/*.d
 tee/ta/*.ta
+
+# 本地模型运行时：llama.cpp 二进制 + GGUF 权重（GB 级），各机自行下载
+.local/
+
+# Kimi Code 技能目录：本机工具配置，不属于项目资产
+.kimi/
