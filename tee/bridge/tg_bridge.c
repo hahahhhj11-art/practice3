@@ -540,16 +540,16 @@ static int tee_invoke(uint32_t cmd, const void *in, size_t in_len, void *out, si
     uint32_t origin = 0;
     memset(&op, 0, sizeof(op));
     if (in) {
-        op.paramTypes = TEEC_PARAM_TYPES(TEEC_PARAM_TYPE_MEMREF_INPUT,
-                                         TEEC_PARAM_TYPE_MEMREF_OUTPUT, TEEC_PARAM_TYPE_NONE,
-                                         TEEC_PARAM_TYPE_NONE);
+        op.paramTypes = TEEC_PARAM_TYPES(TEEC_MEMREF_TEMP_INPUT,
+                                         TEEC_MEMREF_TEMP_OUTPUT, TEEC_NONE,
+                                         TEEC_NONE);
         op.params[0].tmpref.buffer = (void *)in;
         op.params[0].tmpref.size = in_len;
         op.params[1].tmpref.buffer = out;
         op.params[1].tmpref.size = out_len;
     } else {
-        op.paramTypes = TEEC_PARAM_TYPES(TEEC_PARAM_TYPE_MEMREF_OUTPUT, TEEC_PARAM_TYPE_NONE,
-                                         TEEC_PARAM_TYPE_NONE, TEEC_PARAM_TYPE_NONE);
+        op.paramTypes = TEEC_PARAM_TYPES(TEEC_MEMREF_TEMP_OUTPUT, TEEC_NONE,
+                                         TEEC_NONE, TEEC_NONE);
         op.params[0].tmpref.buffer = out;
         op.params[0].tmpref.size = out_len;
     }
@@ -557,6 +557,7 @@ static int tee_invoke(uint32_t cmd, const void *in, size_t in_len, void *out, si
     if (res != TEEC_SUCCESS) {
         snprintf(err, errsz, "TEEC_InvokeCommand(0x%x) 失败: res=0x%x origin=0x%x", cmd, res,
                  origin);
+        fprintf(stderr, "tg_bridge: %s\n", err);
         return -1;
     }
     return 0;
@@ -635,10 +636,10 @@ static int state_save(const tg_state *st, char *err, size_t errsz) {
 
 /* ---------------- JSONL 主循环 ---------------- */
 
-#define LINE_MAX (1 << 20)
+#define TG_LINE_MAX (1 << 20)
 #define FIELD_MAX (512 * 1024)
 
-static char g_line[LINE_MAX];
+static char g_line[TG_LINE_MAX];
 static char g_field[FIELD_MAX];
 static uint8_t g_bin[FIELD_MAX];
 

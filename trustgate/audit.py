@@ -143,6 +143,12 @@ def verify_chain(
     机器之外（手机、云端）。**没有它，尾部截断在原理上就无法检测**——
     删掉最后 K 条之后剩下的前缀本身是一条完全合法的链。这一点必须在
     论文里讲清楚，而不是含糊地说"哈希链能防截断"。
+
+    持久锚（T2/RPMB）的序号跨运行延续，链基址（首条 seq）从首条记录推得、
+    连续性相对基址检查；只有确知创世（基址为 0）时首条的 prev_hash 才对
+    GENESIS 验证。头部删除（从前往后删）在只有尾部检查点时原理上不可
+    检测——校验方不预设基址，删首条后基址随之一同"抬高"。这是与"尾部
+    截断需检查点"并列的诚实边界，论文中应一并表述。
     """
     records = []
     p = Path(path)
@@ -151,11 +157,16 @@ def verify_chain(
             records = [json.loads(ln) for ln in fh if ln.strip()]
 
     problems: list[str] = []
-    prev = GENESIS
+    # seq 采用相对链基址的连续性检查：持久锚（T2/RPMB）的序号跨运行延续，
+    # 首条 seq 是任意历史值；绝对起点由检查点与锚探针对账，不由校验器假设。
+    base = int(records[0].get("seq", 0)) if records else 0
+    # 只有确知链从创世开始时（首条 seq=0），首条的 prev_hash 才能对 GENESIS
+    # 验证；续跑链的首条指向运行前的历史链头，前史不在此文件内，无从对起。
+    prev: str | None = GENESIS if base == 0 else None
     for i, rec in enumerate(records):
-        if rec.get("seq") != i:
+        if rec.get("seq") != base + i:
             problems.append(f"#{i} seq 不连续（得到 {rec.get('seq')}）——有记录被删除或插入")
-        if rec.get("prev_hash") != prev:
+        if prev is not None and rec.get("prev_hash") != prev:
             problems.append(f"#{i} prev_hash 断链——前序记录被修改或删除")
 
         payload = {k: v for k, v in rec.items() if k not in ("seq", "prev_hash", "hash", "mac")}
@@ -172,9 +183,11 @@ def verify_chain(
         exp_seq = int(checkpoint.get("seq", -1))
         if seal_fn(f"{exp_seq}|{exp_head}".encode()) != checkpoint.get("mac"):
             problems.append("检查点自身 MAC 无效——检查点被伪造")
-        elif len(records) != exp_seq:
+        elif not records or int(records[-1].get("seq", -1)) + 1 != exp_seq:
+            last_seq = int(records[-1].get("seq", -1)) if records else -1
             problems.append(
-                f"记录数 {len(records)} 与检查点声明的 {exp_seq} 不符——日志被截断或删改"
+                f"末条 seq+1={last_seq + 1} 与检查点声明的 {exp_seq} 不符"
+                "——日志被截断或删改"
             )
         elif prev != exp_head:
             problems.append("链头与检查点不一致——日志被整体重建")
