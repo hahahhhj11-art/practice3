@@ -143,7 +143,11 @@ def anchor_now(anchor: str, key_source: str, tag: str) -> dict[str, Any]:
 
 def truncate_to(path: Path, checkpoint: dict[str, Any]) -> int:
     lines = path.read_text(encoding="utf-8").splitlines()
-    keep = int(checkpoint.get("seq", len(lines)))
+    # 检查点 seq 是锚的累计计数，减去本日志首条的 seq（链基址）才等于文件内
+    # 行数。T1/软桥基址恒为 0，行为与旧实现一致；T2 的 RPMB 序号跨运行延续，
+    # 基址非 0（一次最小复现就能把基址推到 1），不减去会多保留一条。
+    base = int(json.loads(lines[0]).get("seq", 0)) if lines else 0
+    keep = int(checkpoint.get("seq", len(lines))) - base
     path.write_text("\n".join(lines[:keep]) + "\n", encoding="utf-8")
     return keep
 

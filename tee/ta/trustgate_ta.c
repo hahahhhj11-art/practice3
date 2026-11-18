@@ -106,7 +106,8 @@ static TEE_Result hmac(const uint8_t *msg, size_t msglen, uint8_t out[32]) {
     res = TEE_SetOperationKey(op, key);
     if (res != TEE_SUCCESS)
         goto out_key;
-    res = TEE_MACCompute(op, msg, msglen, out, &outlen);
+    TEE_MACInit(op, NULL, 0); 
+    res = TEE_MACComputeFinal(op, msg, msglen, out, &outlen);
 out_key:
     TEE_FreeTransientObject(key);
 out_op:
@@ -235,24 +236,27 @@ TEE_Result TA_InvokeCommandEntryPoint(void *sess_ctx, uint32_t cmd, uint32_t par
             char seqdec[12];
             size_t seqdeclen = 0;
             size_t plen = params[0].memref.size;
-            size_t total = TG_HEX_LEN + 1 + 12 + 1 + plen;
-            uint8_t *buf = TEE_Malloc(total, 0);
+            size_t total;
             char *p;
-            if (!buf)
-                return TEE_ERROR_OUT_OF_MEMORY;
             u32dec(g_seq, seqdec, &seqdeclen);
-            p = (char *)buf;
-            memcpy(p, prev_hex, TG_HEX_LEN);
-            p += TG_HEX_LEN;
-            *p++ = '|';
-            memcpy(p, seqdec, seqdeclen);
-            p += seqdeclen;
-            *p++ = '|';
-            memcpy(p, params[0].memref.buffer, plen);
-            res = sha256(buf, total, digest);
-            TEE_Free(buf);
-            if (res != TEE_SUCCESS)
-                return res;
+            total = TG_HEX_LEN + 1 + seqdeclen + 1 + plen;
+            {
+                uint8_t *buf = TEE_Malloc(total, 0);
+                if (!buf)
+                    return TEE_ERROR_OUT_OF_MEMORY;
+                p = (char *)buf;
+                memcpy(p, prev_hex, TG_HEX_LEN);
+                p += TG_HEX_LEN;
+                *p++ = '|';
+                memcpy(p, seqdec, seqdeclen);
+                p += seqdeclen;
+                *p++ = '|';
+                memcpy(p, params[0].memref.buffer, plen);
+                res = sha256(buf, total, digest);
+                TEE_Free(buf);
+                if (res != TEE_SUCCESS)
+                    return res;
+            }
         }
         bin2hex(digest, 32, hash_hex);
         if (hmac((const uint8_t *)hash_hex, TG_HEX_LEN, mac) != TEE_SUCCESS)

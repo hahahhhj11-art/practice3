@@ -18,6 +18,12 @@ tee/bridge/tg_bridge_soft.exe
 tee/ta/*.o
 tee/ta/*.d
 tee/ta/*.ta
+tee/ta/*.elf
+tee/ta/*.dmp
+tee/ta/*.map
+tee/ta/*.cmd
+tee/ta/dyn_list
+tee/ta/*.lds
 
 # 本地模型运行时：llama.cpp 二进制 + GGUF 权重（GB 级），各机自行下载
 .local/
