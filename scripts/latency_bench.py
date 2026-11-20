@@ -148,8 +148,13 @@ def main() -> int:
     out.write_text(json.dumps({"runs_per_tier": ns.runs, "note_for_T2": note if "T2" in tiers else None,
                                "tiers": table}, ensure_ascii=False, indent=2), encoding="utf-8")
     print(f"\n已写入 {out.relative_to(ROOT)}")
-    print("提示：T2 行只有在真桥（QEMU guest，RPMB）下采集才可进论文；"
-          "本机数字仅用于检验管线通不通。")
+    if "T2" in tiers:
+        soft = "soft" in Path(os.environ.get("TG_TEE_BRIDGE", ROOT / "tee" / "bridge" / "tg_bridge")).name
+        if soft:
+            print("提示：本次为软模拟桥，数字仅供 plumbing 自检，不得进论文。")
+        else:
+            print("提示：本次 T2 为真桥（QEMU guest + RPMB），数字可进论文；绝对值受 "
+                  "TCG 模拟影响，引用时以同环境 T0/T1/T2 相对开销表述。")
     return 0
 
 

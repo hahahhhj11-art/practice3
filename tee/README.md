@@ -67,19 +67,22 @@ make -j$(nproc) toolchains
 make CCACHE= BR2_PACKAGE_OPTEE_RUST_EXAMPLES_EXT=n BR2_PACKAGE_PYTHON3=y -j$(nproc)
 ```
 
-**5. 冒烟验证 + 打开 RPMB**
+**5. 冒烟验证 + 打开 RPMB（启动命令同时把仓库映射进 guest）**
 
 ```bash
 cd ~/optee/build
-make run-only QEMU_VIRTFS_AUTOMOUNT=y   # 正常世界登录 root 后：xtest 全过
+make run-only QEMU_VIRTFS_AUTOMOUNT=y \
+  QEMU_EXTRA_ARGS="-virtfs local,path=/home/origin/practice3,mount_tag=host0,security_model=mapped-xattr"
+# 正常世界登录 root 后：xtest 全过
 # RPMB 使能方式随版本不同：在构建树内 grep -ri rpmb build/qemu_v8.mk，
 # 确保 tee-supplicant 走 RPMB 后端、guest 内出现 /dev/mmcblk*rpmb。
 # 不落在 RPMB 上的构建**不得**用于论文实验（docs/06 决策 D3）。
 ```
 
-**6. 让 guest 能跑 TrustGate**
+**6. 编译 TA 与桥（host 侧交叉编译，产物经共享目录直达 guest）**
 
-guest 的 buildroot 默认没有 Python，需要加：
+guest 的 buildroot 已带 Python3（步骤 4 的 BR2_PACKAGE_PYTHON3=y），无需再
+配 rootfs。在 host 上编译：
 
 ```bash
 # 一次性：编出 libteec 导出（供 CA 链接）
@@ -99,24 +102,29 @@ make -C ~/practice3/tee bridge \
 
 # 两个产物都必须是 ARM aarch64
 file ~/practice3/tee/ta/*.ta ~/practice3/tee/bridge/tg_bridge
-
-
-# 宿主机：把工程软链进共享根（~/optee 就是默认共享目录）
-ln -s ~/practice3 ~/optee/practice3
-
-make run-only QEMU_VIRTFS_AUTOMOUNT=y
 ```
 
-**7. 采数据（全部在 guest 内、真桥下执行）**
+**7. 每次开 guest 后的点火流程 + 采数据（全部在 guest 内执行）**
 
 ```bash
-export TG_TEE_BRIDGE=$PWD/tee/bridge/tg_bridge    # 名字含 soft 的会被 bench 拒绝
-python3 scripts/replay_demo.py                     # E1：六格结果
-python3 scripts/latency_bench.py --runs 50         # E2：三档延迟表
-python3 -m eval.run_eval --groups C5T2 --limit 20  # 端到端攻击样本
+cd /mnt/host0                                   # 仓库 = host0 共享挂载点
+cp tee/ta/*.ta /lib/optee_armtz/                # 首次或 TA 更新后
+killall tee-supplicant; tee-supplicant -d &     # 重启 supplicant 加载新 TA
+
+export TG_TEE_BRIDGE=$PWD/tee/bridge/tg_bridge  # 真桥；名字含 soft 的会被 bench 拒绝
+
+# 冒烟：应输出 {"result":{"seq":N,...}}——N 延续旧值即 RPMB 持久生效（非 0 属正常）
+printf '{"op":"init"}\n{"op":"chain_append","payload_b64":"e30"}\n' | tee/bridge/tg_bridge
+
+python3 scripts/replay_demo.py                  # E1：六格结果
+python3 scripts/latency_bench.py --runs 50      # E2：三档延迟表
+# C5T2 正式取样（主表口径 27 格 × 2 + 41 良性，docs/03 §4；--limit 20 仅冒烟）
+python3 -m eval.run_eval --groups C5T2 --limit 54 --benign 41 \
+    --out logs/eval-main-c5t2.json
 ```
 
-把 `logs/replay-demo-result.json`、`logs/latency-bench.json`、`logs/eval-report.json` 取回主机。
+把 `logs/replay-demo-result.json`、`logs/latency-bench.json`、
+`logs/eval-main-c5t2.json` 取回主机。
 
 **8. 验收 checklist**
 
@@ -128,6 +136,10 @@ python3 -m eval.run_eval --groups C5T2 --limit 20  # 端到端攻击样本
       guest 运行延续至 665，当次日志基址 655——RPMB 持久的直接证据）
 - [x] 所有产物的桥路径不含 "soft"（`logs/replay-demo-result.json` 的
       bridge 字段为真桥）
+- [x] `latency_bench.py --runs 50` 三档表在真桥下采集（2026-11-20：T2 判定
+      路径与 T1 持平，T2−T0 ≈ +10%；绝对值受 TCG 模拟影响，按相对开销引用）
+- [x] C5T2 组 `--limit 54 --benign 41`：ASR 0%、UA/BTC 100%、0 装置错误、
+      0 层偏离（2026-11-20，`logs/eval-main-c5t2.json`）
 
 ## 踩坑记录（真机联调实录，2026-11-18）
 
