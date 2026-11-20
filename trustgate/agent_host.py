@@ -51,7 +51,7 @@ class ProxyLLM(LLMBackend):
     口子——Landlock 与 seccomp 都无法按主机名过滤，开一个口子等于开整张网——
     不如把模型端点声明为 TCB 内一条**目的地固定**的外发通道：父进程在这条
     通道上只做字节转发，不做任何策略判定，所以可信计算基没有因此承担新的
-    语义职责；附带好处是每一次提示词都自然落进审计，为取证层留下了输入。
+    语义职责。父进程受理时把请求摘要写入审计，不保存提示词原文。
     """
 
     def __init__(self, channel: AttachedBrokerClient, name: str = "proxy"):
