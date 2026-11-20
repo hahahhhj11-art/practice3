@@ -151,7 +151,7 @@ Windows 上只能做到 Job Object 的生命周期约束，文件与网络无内
 | --- | --- | --- | --- |
 | T0 | 同进程 | `file` | 无（仅测功能与延迟下界） |
 | T1 | 独立进程 + 单向 stdio | `ephemeral` | 除跨会话回滚外全部 |
-| T2 | QEMU + OP-TEE TA | TEE 安全存储（RPMB） | 全部（代码完成，待真机评测） |
+| T2 | QEMU + OP-TEE TA（RPMB） | TEE 安全存储（RPMB） | 全部（2026-11-18 真机联调通过：E1 重放检测六格符合设计，见 `docs/06` §9） |
 
 T1 与 T2 的能力差值就是 TEE 必要性的量化答案：T1 的单调序号活在进程内存里，重启归零，挡不住重放旧检查点。
 
@@ -229,7 +229,9 @@ attacks/generate.py 攻击样本生成器（目标 × 规避层级 × 载体 × 
 eval/run_eval.py         C0–C5 对比实验与指标统计（ASR@obedient）
 eval/run_model_eval.py   真实模型两臂实验（易感性 S / ASR@model / CBR）
 scripts/            reproduce（一键复现）/ bypass_demo / tamper_demo /
-                    forensics_report / run_task / serve_corpus / verify_audit
+                    replay_demo（E1）/ latency_bench（E2）/ forensics_report /
+                    run_task / serve_corpus / verify_audit / report_table /
+                    run_agentdojo / run_manifest_eval / setup_local_llm（本地 Qwen）
 tests/              防御回归 + 数据集有效性 + 非绕过性 + 取证 + 实验口径
 docs/               威胁模型、系统架构、实验设计与效度、论文骨架
 policy.json         策略配置（参与 attestation）
@@ -247,6 +249,7 @@ policy.json         策略配置（参与 attestation）
 | [`docs/03-实验设计与效度.md`](docs/03-实验设计与效度.md) | C0–C5 设计、主结果、效度限定与修正记录、实验进度台账 |
 | [`docs/04-文献对齐与漏洞修复.md`](docs/04-文献对齐与漏洞修复.md) | 以文献口径自检发现的可利用漏洞及其修复 |
 | [`docs/05-论文骨架.md`](docs/05-论文骨架.md) | 按 USENIX/NDSS 结构组织的论点—证据台账：每节的主张、证据产出物、以及**明确不声称什么** |
+| [`docs/06-T2可信锚实现方案.md`](docs/06-T2可信锚实现方案.md) | T2（QEMU+OP-TEE+RPMB）决策记录、实现方案与 2026-11-18 真机验收数据 |
 
 ---
 

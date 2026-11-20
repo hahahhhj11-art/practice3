@@ -10,13 +10,12 @@
 #   bash scripts/setup_local_llm.sh stop     # 停止服务
 #
 # 启动后配合评测：
-#   TG_API_KEY=local TG_BASE_URL=http://127.0.0.1:8811/v1 \
+#   TG_API_KEY=local TG_BASE_URL=http://127.0.0.1:8899/v1 \
 #     python3 -m eval.run_model_eval --model qwen2.5-7b-instruct \
 #       --limit 5 --runs 3 --temperature 1.0 --no-cache
 #
 # 注意：模型权重约 3.8GB，下载到 .local/（已被 .gitignore 排除，不进版本库）。
-# 端口 8811 是刻意选的——tests/test_defense.py 的样本服务器用 8811，
-# 跑测试前请先停止本服务。
+# 端口 8899 刻意避开测试端口（tests 用 8799 与 8811），与测试套件互不干扰。
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -27,7 +26,7 @@ MODEL_URL="https://hf-mirror.com/Qwen/Qwen2.5-7B-Instruct-GGUF/resolve/main/$MOD
 BIN_URL="https://github.com/ggml-org/llama.cpp/releases/download/$BUILD/llama-$BUILD-bin-ubuntu-x64.tar.gz"
 
 if [ "${1:-}" = "stop" ]; then
-    pkill -f "llama-server.*--port 8811" && echo "已停止" || echo "服务未在运行"
+    pkill -f "llama-server.*--port 8899" && echo "已停止" || echo "服务未在运行"
     exit 0
 fi
 
@@ -45,19 +44,19 @@ if [ ! -f "$MODEL_FILE" ]; then
     curl -sL -o "$MODEL_FILE" "$MODEL_URL"
 fi
 
-if curl -s -m 2 http://127.0.0.1:8811/v1/models > /dev/null 2>&1; then
-    echo "==> 服务已在运行（:8811）"
+if curl -s -m 2 http://127.0.0.1:8899/v1/models > /dev/null 2>&1; then
+    echo "==> 服务已在运行（:8899）"
 else
-    echo "==> 启动 llama-server（:8811，8 线程）"
+    echo "==> 启动 llama-server（:8899，8 线程）"
     nohup ./"llama-$BUILD"/llama-server -m "$MODEL_FILE" \
-        --alias qwen2.5-7b-instruct --port 8811 -t 8 -c 4096 --no-warmup \
+        --alias qwen2.5-7b-instruct --port 8899 -t 8 -c 4096 --no-warmup \
         > server.log 2>&1 &
     for i in $(seq 1 60); do
-        curl -s -m 2 http://127.0.0.1:8811/v1/models > /dev/null 2>&1 && break
+        curl -s -m 2 http://127.0.0.1:8899/v1/models > /dev/null 2>&1 && break
         sleep 2
     done
 fi
 
-curl -s -m 10 http://127.0.0.1:8811/v1/models | head -c 200
+curl -s -m 10 http://127.0.0.1:8899/v1/models | head -c 200
 echo
-echo "==> 就绪。预检：TG_API_KEY=local TG_BASE_URL=http://127.0.0.1:8811/v1 python3 -m eval.run_model_eval --model qwen2.5-7b-instruct --preflight"
+echo "==> 就绪。预检：TG_API_KEY=local TG_BASE_URL=http://127.0.0.1:8899/v1 python3 -m eval.run_model_eval --model qwen2.5-7b-instruct --preflight"
