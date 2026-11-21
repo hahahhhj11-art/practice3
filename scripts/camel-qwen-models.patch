@@ -1,0 +1,17 @@
+diff --git a/src/camel/models.py b/src/camel/models.py
+index 7ebce22..13eadb1 100644
+--- a/src/camel/models.py
++++ b/src/camel/models.py
+@@ -47,6 +47,12 @@ _supported_model_names = {
+     "gpt-4o-mini-2024-07-18": "GPT-4",
+     "gpt-4.1-2025-04-14": "ChatGPT",
+     "gpt-4.1-nano-2025-04-14": "ChatGPT",
++    # 本地交叉实测接入的非官方清单模型：身份模板用通用的 "AI assistant"
++    #（agentdojo 攻击模板合法名单之一），API 模型名不受影响。
++    "deepseek-chat": "AI assistant",
++    "deepseek-reasoner": "AI assistant",
++    # 本地 llama.cpp 部署的 Qwen2.5-7B（OpenAI 兼容端点），交叉实测用
++    "qwen2.5-7b-instruct": "AI assistant",
+ } | _oai_thinking_models_with_effort
+ suffixes = ["", "+camel", "+camel+secpol", "+camel+secpol+strict"]
+ 

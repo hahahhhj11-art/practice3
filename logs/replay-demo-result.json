@@ -1,0 +1,59 @@
+{
+  "bridge": "/mnt/host0/tee/bridge/tg_bridge（真桥）",
+  "results": [
+    {
+      "tier": "T1-ephemeral",
+      "scenario": "control",
+      "verdict": "锚无持久状态可反驳 → 未检测",
+      "chain_ok": true,
+      "consistent": false,
+      "presented_seq": 10,
+      "anchor_now_seq": 0
+    },
+    {
+      "tier": "T1-ephemeral",
+      "scenario": "attack",
+      "verdict": "锚无持久状态可反驳 → 未检测",
+      "chain_ok": true,
+      "consistent": false,
+      "presented_seq": 5,
+      "anchor_now_seq": 0
+    },
+    {
+      "tier": "T1-file",
+      "scenario": "control",
+      "verdict": "锚无持久状态可反驳 → 未检测",
+      "chain_ok": true,
+      "consistent": false,
+      "presented_seq": 10,
+      "anchor_now_seq": 0
+    },
+    {
+      "tier": "T1-file",
+      "scenario": "attack",
+      "verdict": "锚无持久状态可反驳 → 未检测",
+      "chain_ok": true,
+      "consistent": false,
+      "presented_seq": 5,
+      "anchor_now_seq": 0
+    },
+    {
+      "tier": "T2",
+      "scenario": "control",
+      "verdict": "通过（无篡改）",
+      "chain_ok": true,
+      "consistent": true,
+      "presented_seq": 665,
+      "anchor_now_seq": 665
+    },
+    {
+      "tier": "T2",
+      "scenario": "attack",
+      "verdict": "检测到重放/截断",
+      "chain_ok": true,
+      "consistent": false,
+      "presented_seq": 660,
+      "anchor_now_seq": 665
+    }
+  ]
+}

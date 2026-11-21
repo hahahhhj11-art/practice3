@@ -40,8 +40,11 @@ time git ls-remote https://github.com/OP-TEE/manifest.git HEAD
 
 ```bash
 sudo apt update && sudo apt install -y \
-  repo git build-essential python3 python3-pip mtools device-tree-compiler \
-  u-boot-tools qemu-system-arm flex bison libssl-dev libgnutls28-dev
+  repo git build-essential python3 python3-pip python3-pyelftools \
+  mtools device-tree-compiler u-boot-tools flex bison \
+  libssl-dev libgnutls28-dev zlib1g-dev libglib2.0-dev libpixman-1-dev \
+  libslirp-dev ninja-build pkg-config rsync cpio wget unzip bc uuid-dev
+
 mkdir -p ~/.bin
 curl -L https://storage.googleapis.com/git-repo-downloads/repo > ~/.bin/repo
 chmod +x ~/.bin/repo && export PATH="$HOME/.bin:$PATH"
@@ -60,58 +63,105 @@ repo sync -j$(nproc)        # 约 20GB，网络决定快慢
 ```bash
 cd ~/optee/build
 make -j$(nproc) toolchains
-make -j$(nproc) all
+# ccache 已装 → 必须带 CCACHE=；禁用 Rust → 带 BR2_PACKAGE_OPTEE_RUST_EXAMPLES_EXT=n
+make CCACHE= BR2_PACKAGE_OPTEE_RUST_EXAMPLES_EXT=n BR2_PACKAGE_PYTHON3=y -j$(nproc)
 ```
 
-**5. 冒烟验证 + 打开 RPMB**
+**5. 冒烟验证 + 打开 RPMB（启动命令同时把仓库映射进 guest）**
 
 ```bash
-make run-only     # 正常世界登录 root 后：xtest 全过
+cd ~/optee/build
+make run-only QEMU_VIRTFS_AUTOMOUNT=y \
+  QEMU_EXTRA_ARGS="-virtfs local,path=/home/origin/practice3,mount_tag=host0,security_model=mapped-xattr"
+# 正常世界登录 root 后：xtest 全过
 # RPMB 使能方式随版本不同：在构建树内 grep -ri rpmb build/qemu_v8.mk，
 # 确保 tee-supplicant 走 RPMB 后端、guest 内出现 /dev/mmcblk*rpmb。
 # 不落在 RPMB 上的构建**不得**用于论文实验（docs/06 决策 D3）。
 ```
 
-**6. 让 guest 能跑 TrustGate**
+**6. 编译 TA 与桥（host 侧交叉编译，产物经共享目录直达 guest）**
 
-guest 的 buildroot 默认没有 Python，需要加：
-
-```bash
-cd ~/optee/buildroot && make menuconfig
-# Target packages → Interpreter languages and scripting → python3 → 保存
-cd ~/optee/build && make -j$(nproc) all   # 重打包 rootfs
-```
-
-把 TrustGate 仓库弄进 guest（任选其一：scp、共享目录，或拷进 rootfs overlay），
-然后在 **guest 内**构建 T2 组件：
+guest 的 buildroot 已带 Python3（步骤 4 的 BR2_PACKAGE_PYTHON3=y），无需再
+配 rootfs。在 host 上编译：
 
 ```bash
-cd <trustgate>
-make -C tee ta     TA_DEV_KIT_DIR=~/optee/optee_os/out/arm/export-ta_arm64
-make -C tee bridge TEEC_DIR=~/optee/optee_client/install
-cp tee/ta/*.ta /lib/optee_armtz/ && pkill tee-supplicant || true
+# 一次性：编出 libteec 导出（供 CA 链接）
+cd ~/optee/optee_client
+make CROSS_COMPILE=$HOME/optee/toolchains/aarch64/bin/aarch64-linux-gnu- WITH_TEEACL=0
+# 产物在 ~/optee/optee_client/out/export/usr/{include,lib}
+
+# 编译 TA（CROSS_COMPILE 必须显式传！不传会用宿主 x86 gcc，报 -mstrict-align 错）
+make -C ~/practice3/tee ta \
+  TA_DEV_KIT_DIR=$HOME/optee/optee_os/out/arm/export-ta_arm64 \
+  CROSS_COMPILE=$HOME/optee/toolchains/aarch64/bin/aarch64-linux-gnu-
+
+# 编译 CA/bridge
+make -C ~/practice3/tee bridge \
+  TEEC_DIR=$HOME/optee/optee_client/out/export/usr \
+  CROSS_COMPILE=$HOME/optee/toolchains/aarch64/bin/aarch64-linux-gnu-
+
+# 两个产物都必须是 ARM aarch64
+file ~/practice3/tee/ta/*.ta ~/practice3/tee/bridge/tg_bridge
 ```
 
-**7. 采数据（全部在 guest 内、真桥下执行）**
+**7. 每次开 guest 后的点火流程 + 采数据（全部在 guest 内执行）**
 
 ```bash
-export TG_TEE_BRIDGE=$PWD/tee/bridge/tg_bridge    # 名字含 soft 的会被 bench 拒绝
-python3 scripts/replay_demo.py                     # E1：六格结果
-python3 scripts/latency_bench.py --runs 50         # E2：三档延迟表
-python3 -m eval.run_eval --groups C5T2 --limit 20  # 端到端攻击样本
+cd /mnt/host0                                   # 仓库 = host0 共享挂载点
+cp tee/ta/*.ta /lib/optee_armtz/                # 首次或 TA 更新后
+killall tee-supplicant; tee-supplicant -d &     # 重启 supplicant 加载新 TA
+
+export TG_TEE_BRIDGE=$PWD/tee/bridge/tg_bridge  # 真桥；名字含 soft 的会被 bench 拒绝
+
+# 冒烟：应输出 {"result":{"seq":N,...}}——N 延续旧值即 RPMB 持久生效（非 0 属正常）
+printf '{"op":"init"}\n{"op":"chain_append","payload_b64":"e30"}\n' | tee/bridge/tg_bridge
+
+python3 scripts/replay_demo.py                  # E1：六格结果
+python3 scripts/latency_bench.py --runs 50      # E2：三档延迟表
+# C5T2 正式取样（主表口径 27 格 × 2 + 41 良性，docs/03 §4；--limit 20 仅冒烟）
+python3 -m eval.run_eval --groups C5T2 --limit 54 --benign 41 \
+    --out logs/eval-main-c5t2.json
 ```
 
-把 `logs/replay-demo-result.json`、`logs/latency-bench.json`、`logs/eval-report.json` 取回主机。
+把 `logs/replay-demo-result.json`、`logs/latency-bench.json`、
+`logs/eval-main-c5t2.json` 取回主机。
 
 **8. 验收 checklist**
 
-- [ ] `xtest` 通过，`/dev/tee0` 存在
-- [ ] `/lib/optee_armtz/7c1c3f20-*.ta` 已安装
-- [ ] `replay_demo.py` 的 T2 攻击格 = "检测到重放/截断"
-- [ ] 断电重启 guest 后，`checkpoint.seq` 延续（RPMB 生效的铁证）
-- [ ] 所有产物的桥路径不含 "soft"
+- [x] `xtest` 通过，`/dev/tee0` 存在（2026-11-18）
+- [x] `/lib/optee_armtz/7c1c3f20-*.ta` 已安装（2026-11-18）
+- [x] `replay_demo.py` 的 T2 攻击格 = "检测到重放/截断"（2026-11-18 实测：
+      出示 C_A seq=660，锚当前 seq=665）
+- [x] 断电重启 guest 后，`checkpoint.seq` 延续（2026-11-18：计数器已跨多次
+      guest 运行延续至 665，当次日志基址 655——RPMB 持久的直接证据）
+- [x] 所有产物的桥路径不含 "soft"（`logs/replay-demo-result.json` 的
+      bridge 字段为真桥）
+- [x] `latency_bench.py --runs 50` 三档表在真桥下采集（2026-11-20：T2 判定
+      路径与 T1 持平，T2−T0 ≈ +10%；绝对值受 TCG 模拟影响，按相对开销引用）
+- [x] C5T2 组 `--limit 54 --benign 41`：ASR 0%、UA/BTC 100%、0 装置错误、
+      0 层偏离（2026-11-20，`logs/eval-main-c5t2.json`）
 
-踩坑记录（RPMB 具体开关、rootfs 改动等）请追加到本文档，下次复现不再重缴学费。
+## 踩坑记录（真机联调实录，2026-11-18）
+
+1. **`TEEC_InvokeCommand` 返回 `0xffff3024`（TARGET_DEAD），安全侧日志
+   `TA panicked with code 0xffff0006`**：桥/TA 会话正常但 TA 被 libutee
+   panic。panic 码就是原始错误码——libutee 对不少 API 实行"错误白名单"，
+   白名单外的错误一律 `TEE_Panic` 上屏；host 侧看不到任何内核日志，
+   **dmesg 不更新是预期**，别去 guest 的 dmesg 里找。本项目实例：MAC 系
+   列 API 必须 `TEE_SetOperationKey` → `TEE_MACInit` → `TEE_MACComputeFinal`
+   三步齐全，漏 `TEE_MACInit` 即 BAD_PARAMETERS → panic（软模拟桥不经
+   libutee，开发期不可见）。定位：看 `make run-only` 终端里的 `D/TC:` 行。
+2. **TA 序号跨运行延续，校验器不得假设 seq 从 0 开始**。真桥 RPMB 的
+   计数器在多次运行间持续上涨（实测日志基址已到 655）；开发期对软模拟
+   桥写的"绝对 seq"校验逻辑一到真机就整体误报。校验一律相对链基址
+   （首条 seq），创世链才额外对 GENESIS 验证 prev_hash；检查点对账用
+   "末条 seq+1 == 检查点 seq"。
+3. **桥编译的三个坑**：TEEC 参数类型常量名是 `TEEC_MEMREF_TEMP_*`（不是
+   `TEEC_PARAM_TYPE_MEMREF_*`）；`LINE_MAX` 与系统头冲突（已改
+   `TG_LINE_MAX`）；交叉编译必须显式传
+   `CROSS_COMPILE=$HOME/optee/toolchains/aarch64/bin/aarch64-linux-gnu-`，
+   否则 TA 会被宿主 x86 gcc 编译并报 `-mstrict-align`。前两项已修进源码，
+   第三项已写进步骤 6。
 
 ## Windows 主机复测（去 CI 盲点）
 

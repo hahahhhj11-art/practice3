@@ -103,6 +103,24 @@ def _host_of(url: str) -> str:
         return ""
 
 
+def manifest_host_allows(url: str, hosts: list[str]) -> bool:
+    """清单里的 ``host`` 放行该主机的任意端口，``host:port`` 只放行那一个端口。
+
+    带端口的写法授权更窄。模型照着任务里的 URL 申请时常把端口一起抄下来，
+    只认裸主机名会把这种清单整份判成申请不足。
+    """
+    try:
+        parsed = urllib.parse.urlparse(url)
+        host = (parsed.hostname or "").lower()
+        port = parsed.port or {"http": 80, "https": 443}.get(parsed.scheme)
+    except ValueError:
+        return False
+    if not host:
+        return False
+    wanted = {h.strip().lower() for h in hosts}
+    return host in wanted or (port is not None and f"{host}:{port}" in wanted)
+
+
 def _query_len(url: str) -> int:
     try:
         parts = urllib.parse.urlparse(url)
@@ -271,9 +289,9 @@ class PolicyEngine:
                     f"路径超出计划授权范围: {rel}（授权前缀: {', '.join(prefixes) or '无'}）",
                 )
         elif call.tool == "web.read":
-            host = _host_of(str(call.args.get("url", "")))
-            if m.hosts and host not in m.hosts:
-                return Decision("deny", "L2.host_not_in_manifest", f"计划未申请域名: {host}")
+            url = str(call.args.get("url", ""))
+            if m.hosts and not manifest_host_allows(url, m.hosts):
+                return Decision("deny", "L2.host_not_in_manifest", f"计划未申请域名: {_host_of(url)}")
 
         return Decision("allow", "L2.manifest_ok")
 
@@ -302,12 +320,35 @@ class PolicyEngine:
                 f"不可逆操作 {call.tool} 的目标仅能溯源自不可信网页内容",
                 risk=spec.risk,
             )
+        # 字符串溯源对不上时是 UNKNOWN，不是拒绝。见过网页之后仍放行，
+        # 对手可以把路径拆成两段、从任务和网页各取一段拼回去，完整路径
+        # 和文件名都不整段出现，L2 又已经按目录前缀授权。这时只放行
+        # 用户任务里逐字写过的目标。污染之前的 UNKNOWN 仍交给清单，
+        # 否则「先按文件名拼路径、再去读网页」的正常顺序会被误杀。
+        if (
+            trust == Trust.UNKNOWN
+            and spec.irreversible
+            and state.taint.session_tainted
+        ):
+            return Decision(
+                "deny",
+                "L3.unknown_irreversible",
+                f"见过不可信内容后，不可逆操作 {call.tool} 的目标不在用户任务原文里",
+                risk=spec.risk,
+            )
 
         if trust == Trust.UNTRUSTED and call.tool == "fs.read":
             return Decision(
                 "deny",
                 "L3.untrusted_read_target",
                 "待读取路径来自不可信网页内容，而非用户任务",
+                risk=spec.risk,
+            )
+        if trust == Trust.UNKNOWN and call.tool == "fs.read" and state.taint.session_tainted:
+            return Decision(
+                "deny",
+                "L3.unknown_read_target",
+                "见过不可信内容后，待读取路径不在用户任务原文里",
                 risk=spec.risk,
             )
 
@@ -372,19 +413,25 @@ class PolicyEngine:
             elen = int(meta.get("egress_len", 0))
             url = str(call.args.get("url", ""))
             dest_trusted = state.taint.origin(url) is Trust.TRUSTED
-            if bool(ex.get("require_trusted_dest_after_sensitive", True)) and not dest_trusted:
-                return Decision(
-                    "deny",
-                    "L4.exfil_chain",
-                    f"检测到外泄链：本会话曾读取敏感内容，现发起指向非用户指定地址的外发请求"
-                    f"（可控载荷 {elen} 字节）",
-                    risk=100,
+            # 长度阈值不再施加于用户亲口指定的 URL。整条 URL（含查询串）逐字
+            # 出现在任务里才是 TRUSTED，攻击者往上面追加任何字节都会失去这个
+            # 标签。若对 TRUSTED 仍按 min_query_len_for_chain 拒绝，则「先读我
+            # 点名的备忘，再打开我给的 ?topic= 链接」会被 L4.exfil_chain 误杀
+            # ——查询串是用户写的，不是外泄载荷。
+            untrusted_dest = not dest_trusted
+            over_budget = elen >= int(ex.get("min_query_len_for_chain", 8))
+            require_trusted = bool(ex.get("require_trusted_dest_after_sensitive", True))
+            if untrusted_dest and (require_trusted or over_budget):
+                why = (
+                    "指向非用户指定地址"
+                    if require_trusted
+                    else f"含 {elen} 字节可控载荷"
                 )
-            if elen >= int(ex.get("min_query_len_for_chain", 8)):
                 return Decision(
                     "deny",
                     "L4.exfil_chain",
-                    f"检测到外泄链：本会话曾读取敏感内容，现发起含 {elen} 字节可控载荷的外发请求",
+                    f"检测到外泄链：本会话曾读取敏感内容，现发起{why}的外发请求"
+                    f"（可控载荷 {elen} 字节）",
                     risk=100,
                 )
 
@@ -543,8 +590,7 @@ def _within_manifest(call: ToolCall, state: SessionState, meta: dict[str, Any]) 
         prefixes = m.read_prefixes if call.tool == "fs.read" else m.write_prefixes
         return bool(matches_any(rel, list(prefixes)))
     if call.tool == "web.read":
-        host = _host_of(str(call.args.get("url", "")))
-        return not m.hosts or host in m.hosts
+        return not m.hosts or manifest_host_allows(str(call.args.get("url", "")), m.hosts)
     return True
 
 

@@ -1,0 +1,8 @@
+Cannot read termcap database;
+using dumb terminal settings.
+/home/origin/practice3/.local/camel-prompt-injection/.venv/lib/python3.10/site-packages/agentdojo/benchmark.py:205: UserWarning: Not all injection tasks were solved as user tasks.
+  warnings.warn("Not all injection tasks were solved as user tasks.")
+banking - utility: 0.3055555555555556
+banking - security: 0.4166666666666667
+overall - utility: 0.3055555555555556
+overall - security: 0.4166666666666667
